@@ -78,18 +78,22 @@ def reconstruct_owner_from_block(lines: List[str]) -> str:
     i = 0
     while i < len(tokens):
         tok = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'']", "", tokens[i])
-        if not tok: i += 1; continue
+        if not tok:
+            i += 1
+            continue
         if len(tok) == 1 and i + 1 < len(tokens):
             nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", tokens[i + 1])
-            if nxt and len(nxt) >= 2: clean.append(tok+nxt); i += 2; continue
+            if nxt and len(nxt) >= 2:
+                clean.append(tok + nxt); i += 2; continue
         if len(tok) <= 2 and i + 1 < len(tokens):
             nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", tokens[i + 1])
-            if nxt and len(nxt) >= 3: clean.append(tok+nxt); i += 2; continue
+            if nxt and len(nxt) >= 3:
+                clean.append(tok + nxt); i += 2; continue
         if i + 2 < len(tokens):
             nxt1 = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", tokens[i + 1])
             nxt2 = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", tokens[i + 2])
             if nxt1 and len(nxt1) == 1 and nxt2 and len(nxt2) >= 3:
-                clean.append(tok+nxt1+nxt2); i += 3; continue
+                clean.append(tok + nxt1 + nxt2); i += 3; continue
         clean.append(tok); i += 1
     name = " ".join(clean)
     name = re.sub(r"\s{2,}", " ", name).strip()
@@ -187,18 +191,28 @@ def page1_to_bgr(pdf_bytes: bytes, dpi: int = 450) -> np.ndarray:
     arr = np.array(pil_img)[:, :, ::-1]  # RGB -> BGR
     return arr
 
+def as_int_conf(val) -> int:
+    """Convierte conf de Tesseract (int / float en str) a int seguro."""
+    try:
+        return int(float(val))
+    except Exception:
+        return -1
+
 def tesseract_boxes(img: np.ndarray, psm: int) -> List[dict]:
     """Devuelve las cajas OCR con conf y texto usando image_to_data."""
     cfg = f"--psm {psm} -c tessedit_char_whitelist=0123456789"
     data = pytesseract.image_to_data(img, config=cfg, output_type=pytesseract.Output.DICT)
     out = []
-    n = len(data["text"])
+    n = len(data.get("text", []))
     for i in range(n):
-        txt = (data["text"][i] or "").strip()
-        conf = int(data["conf"][i]) if data["conf"][i].isdigit() else -1
-        if not txt: continue
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        out.append({"text": txt, "conf": conf, "box": (x,y,w,h)})
+        txt_raw = data["text"][i]
+        txt = str(txt_raw or "").strip()
+        conf = as_int_conf(data["conf"][i])
+        if not txt:
+            continue
+        x = int(data["left"][i]);  y = int(data["top"][i])
+        w = int(data["width"][i]); h = int(data["height"][i])
+        out.append({"text": txt, "conf": conf, "box": (x, y, w, h)})
     return out
 
 def preprocess_variants(bgr: np.ndarray) -> List[np.ndarray]:
@@ -234,7 +248,8 @@ def find_number_positions(bgr: np.ndarray, targets: List[str]) -> Dict[str, List
             boxes = tesseract_boxes(var, psm=p)
             for b in boxes:
                 txt = re.sub(r"\D+", "", b["text"])
-                if not txt: continue
+                if not txt:
+                    continue
                 if txt in results:
                     x,y,w,h = b["box"]
                     results[txt].append( (x,y,w,h,b["conf"]) )
@@ -244,16 +259,14 @@ def center_of(box):
     x,y,w,h,conf = box
     return (x + w//2, y + h//2)
 
-def choose_main_center(cands_72: List[Tuple[int,int,int,int,int]], neighbors_centers: List[Tuple[int,int]]) -> Optional[Tuple[int,int]]:
-    if not cands_72:
+def choose_main_center(cands_self: List[Tuple[int,int,int,int,int]], neighbors_centers: List[Tuple[int,int]]) -> Optional[Tuple[int,int]]:
+    if not cands_self:
         return None
     if not neighbors_centers:
-        # elige el 72 más centrado en página
-        return min([center_of(b) for b in cands_72], key=lambda c: c[0]*c[0]+c[1]*c[1])
-    # elige el 72 más cercano al centroide de vecinos
+        return min([center_of(b) for b in cands_self], key=lambda c: c[0]*c[0]+c[1]*c[1])
     cx = int(sum(p[0] for p in neighbors_centers) / len(neighbors_centers))
     cy = int(sum(p[1] for p in neighbors_centers) / len(neighbors_centers))
-    return min([center_of(b) for b in cands_72], key=lambda c: (c[0]-cx)**2 + (c[1]-cy)**2)
+    return min([center_of(b) for b in cands_self], key=lambda c: (c[0]-cx)**2 + (c[1]-cy)**2)
 
 def side_of(main: Tuple[int,int], pt: Tuple[int,int]) -> str:
     cx, cy = main
@@ -273,56 +286,52 @@ def extract(data: ExtractIn = Body(...)) -> ExtractOut:
     parcel2owner = extract_owners_by_parcel(pdf_bytes)
     fallback_owners = extract_owners_fallback_list(pdf_bytes)
 
-    # Qué parcelas buscar: la propia + las colindantes detectadas en texto
-    target_parcels = set(parcel2owner.keys())
-    # si deducimos la tuya de la RC (últimos dígitos) mejor, pero mín. intenta "72"
+    # Intento de deducir tu parcela (self) desde el texto
     guessed_self = None
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        t0 = (pdf.pages[0].extract_text() or "") + "\n" + (pdf.pages[1].extract_text() or "")
-        mself = re.search(r"PARCELA\s+(\d+)", t0, flags=re.I)
-        if mself:
-            guessed_self = mself.group(1)
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            t0 = (pdf.pages[0].extract_text() or "") + "\n" + (pdf.pages[1].extract_text() or "")
+            mself = re.search(r"PARCELA\s+(\d+)", t0, flags=re.I)
+            if mself:
+                guessed_self = mself.group(1)
+    except Exception:
+        pass
+
+    # Conjunto de objetivos: tu parcela + las que tengan titular en texto
+    target_parcels = set(parcel2owner.keys())
     if guessed_self:
         target_parcels.add(guessed_self)
-    else:
-        # último recurso: si hay exactamente 4 colindantes, intenta la que falta respecto a 71-74-... (no siempre sirve)
-        pass
 
     # 2) OCR de números en página 1
     note_parts = []
+    linderos = {"norte": "", "sur": "", "oeste": "", "este": ""}
     try:
         bgr = page1_to_bgr(pdf_bytes, dpi=450)
-        targets = sorted(target_parcels)[:8]  # seguridad
+        targets = sorted(target_parcels)[:12]  # límite seguridad
         num_boxes = find_number_positions(bgr, targets=targets)
 
-        # centros vecinos (todas menos la tuya)
         neighbors_centers: List[Tuple[int,int]] = []
-        self_centers: List[Tuple[int,int]] = []
+        self_boxes = num_boxes.get(guessed_self, []) if guessed_self else []
 
+        # centros de vecinos (todas menos la tuya)
         for num, boxes in num_boxes.items():
-            centers = [center_of(b) for b in boxes]
-            if not centers: continue
-            # heurística de cuál es "tu" parcela: guessed_self si existe
             if guessed_self and num == guessed_self:
-                self_centers.extend(centers)
-            else:
-                neighbors_centers.extend(centers)
+                continue
+            neighbors_centers.extend([center_of(b) for b in boxes])
 
-        main_center = choose_main_center(num_boxes.get(guessed_self, []), neighbors_centers) if guessed_self else None
-        if not main_center and self_centers:
-            # elige la más centrada
-            main_center = min(self_centers, key=lambda c: c[0]*c[0]+c[1]*c[1])
+        main_center = choose_main_center(self_boxes, neighbors_centers) if guessed_self else None
+        if not main_center and self_boxes:
+            main_center = min([center_of(b) for b in self_boxes], key=lambda c: c[0]*c[0]+c[1]*c[1])
 
         # Asignación cardinal → número de parcela vecino más cercano en cada cuadrante
         linderos_by_num: Dict[str, str] = {}
         if main_center and neighbors_centers:
-            # para cada número detectado, coge el centro más cercano a main_center
             best_per_side: Dict[str, Tuple[str, Tuple[int,int], int]] = {}
             for num, boxes in num_boxes.items():
-                if guessed_self and num == guessed_self:  # saltar la tuya
+                if guessed_self and num == guessed_self:
                     continue
-                if not boxes: continue
-                # mejor caja por proximidad al main
+                if not boxes: 
+                    continue
                 c = min([center_of(b) for b in boxes], key=lambda p: (p[0]-main_center[0])**2 + (p[1]-main_center[1])**2)
                 sd = side_of(main_center, c)
                 d2 = (c[0]-main_center[0])**2 + (c[1]-main_center[1])**2
@@ -334,7 +343,6 @@ def extract(data: ExtractIn = Body(...)) -> ExtractOut:
                     linderos_by_num[sd] = parcel2owner[num]
 
         # 3) Montar respuesta final
-        linderos = {"norte": "", "sur": "", "oeste": "", "este": ""}
         linderos.update(linderos_by_num)
 
         # 4) Completar con fallback si faltan lados
@@ -350,7 +358,6 @@ def extract(data: ExtractIn = Body(...)) -> ExtractOut:
                         used.add(fallback_owners[idx])
                         idx += 1
 
-        # Nota de depuración (útil mientras afinamos)
         if not any(linderos.values()):
             note_parts.append("OCR sin coincidencias claras; afinaremos binarización/PSM.")
         else:
@@ -364,13 +371,15 @@ def extract(data: ExtractIn = Body(...)) -> ExtractOut:
 
     except Exception as e:
         # Si algo revienta, devolvemos al menos los owners detectados
+        owners_detected = list(dict.fromkeys(list(parcel2owner.values()) + fallback_owners))[:8]
         return ExtractOut(
             linderos={"norte":"","sur":"","oeste":"","este":""},
-            owners_detected=list(dict.fromkeys(list(parcel2owner.values()) + fallback_owners))[:8],
+            owners_detected=owners_detected,
             note=f"Excepción visión/OCR: {e}"
         )
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
