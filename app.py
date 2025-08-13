@@ -8,12 +8,14 @@ import numpy as np
 import cv2
 import pytesseract
 from PIL import Image
+import subprocess
 
-app = FastAPI(title="AutoCatastro AI", version="0.2.4-fast")
+app = FastAPI(title="AutoCatastro AI", version="0.2.4-fast+diag")
 
 # -------- Flags/entorno --------
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
-FAST_MODE = (os.getenv("FAST_MODE", "0").strip() == "1")  # ← activa modo rápido con FAST_MODE=1
+FAST_MODE  = (os.getenv("FAST_MODE",  "0").strip() == "1")  # reduce DPI/PSM/variantes OCR
+TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")  # salta OCR; usa solo texto
 
 def check_token(x_autocata_token: str = Header(default="")):
     if AUTH_TOKEN and x_autocata_token != AUTH_TOKEN:
@@ -102,10 +104,7 @@ def reconstruct_owner_from_block(lines: List[str]) -> str:
     return name
 
 def extract_owners_by_parcel(pdf_bytes: bytes) -> Dict[str, str]:
-    """
-    Construye dict: parcela -> titular.
-    Regla: detecta “Parcela (\d+)” y toma 1–4 líneas MAYÚSCULAS siguientes como nombre.
-    """
+    """Construye dict: parcela -> titular (toma 1–4 líneas en mayúsculas tras 'Parcela N')."""
     mapping: Dict[str, str] = {}
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -206,10 +205,8 @@ def page1_to_bgr(pdf_bytes: bytes) -> np.ndarray:
 def crop_map_region_with_offset(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
     """Recorta cabecera/pie/bordes y devuelve (crop, (offset_x, offset_y))."""
     h, w = bgr.shape[:2]
-    top = int(h * 0.12)
-    bottom = int(h * 0.92)
-    left = int(w * 0.07)
-    right = int(w * 0.93)
+    top = int(h * 0.12); bottom = int(h * 0.92)
+    left = int(w * 0.07); right  = int(w * 0.93)
     top = max(0, top); bottom = min(h, bottom)
     left = max(0, left); right = min(w, right)
     if bottom - top < 100 or right - left < 100:
@@ -244,34 +241,25 @@ def preprocess_variants(bgr: np.ndarray) -> List[np.ndarray]:
     out: List[np.ndarray] = []
 
     if FAST_MODE:
-        # Más ligero: solo Otsu y Otsu invertido con ligero reescalado
         g2 = cv2.resize(gray, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-        _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(bw)
+        _, bw  = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(bw)
         _, bwi = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU); out.append(bwi)
         return out
 
-    # Completo
-    base = [
-        gray,
-        cv2.medianBlur(gray, 3),
-        cv2.GaussianBlur(gray, (5,5), 0),
-    ]
+    base = [gray, cv2.medianBlur(gray, 3), cv2.GaussianBlur(gray, (5,5), 0)]
     for g in base:
         g2 = cv2.resize(g, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
-        _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(bw)
+        _, bw  = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); out.append(bw)
         _, bwi = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU); out.append(bwi)
-        ada = cv2.adaptiveThreshold(g2,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9); out.append(ada)
-        ada2= cv2.adaptiveThreshold(g2,255,cv2.ADAPTIVE_THRESH_MEAN_C,     cv2.THRESH_BINARY, 31, 7); out.append(ada2)
+        ada  = cv2.adaptiveThreshold(g2,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9); out.append(ada)
+        ada2 = cv2.adaptiveThreshold(g2,255,cv2.ADAPTIVE_THRESH_MEAN,     cv2.THRESH_BINARY, 31, 7); out.append(ada2)
         kern = np.ones((2,2), np.uint8)
         out.append(cv2.dilate(bw,  kern, iterations=1))
         out.append(cv2.dilate(ada, kern, iterations=1))
     return out
 
 def find_number_positions(bgr: np.ndarray, targets: List[str]) -> Dict[str, List[Tuple[int,int,int,int,int]]]:
-    """
-    Busca posiciones de números exactos en el recorte y devuelve
-    dict num -> lista de cajas (x,y,w,h,conf) en coords absolutas.
-    """
+    """Busca posiciones de números exactos en el recorte y devuelve dict num -> cajas (abs)."""
     results: Dict[str, List[Tuple[int,int,int,int,int]]] = {t: [] for t in targets}
     crop, (ox, oy) = crop_map_region_with_offset(bgr)
     variants = preprocess_variants(crop)
@@ -310,13 +298,11 @@ def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     mask_p = np.zeros(hsv.shape[:2], dtype=np.uint8)
     for lo, hi in p_ranges:
         mask_p = cv2.bitwise_or(mask_p, cv2.inRange(hsv, lo, hi))
-    k3 = np.ones((3, 3), np.uint8)
-    k5 = np.ones((5, 5), np.uint8)
-    for _ in range(1):
-        mask_g = cv2.morphologyEx(mask_g, cv2.MORPH_OPEN, k3)
-        mask_g = cv2.morphologyEx(mask_g, cv2.MORPH_CLOSE, k5)
-        mask_p = cv2.morphologyEx(mask_p, cv2.MORPH_OPEN, k3)
-        mask_p = cv2.morphologyEx(mask_p, cv2.MORPH_CLOSE, k5)
+    k3 = np.ones((3, 3), np.uint8); k5 = np.ones((5, 5), np.uint8)
+    mask_g = cv2.morphologyEx(mask_g, cv2.MORPH_OPEN, k3)
+    mask_g = cv2.morphologyEx(mask_g, cv2.MORPH_CLOSE, k5)
+    mask_p = cv2.morphologyEx(mask_p, cv2.MORPH_OPEN, k3)
+    mask_p = cv2.morphologyEx(mask_p, cv2.MORPH_CLOSE, k5)
     return mask_g, mask_p
 
 def contours_centroids(mask: np.ndarray, min_area: int = 200) -> List[Tuple[int, int, int]]:
@@ -350,9 +336,9 @@ def extract(
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
 
     # 1) Texto: mapeo parcela->titular y lista de parcelas por texto
-    parcel2owner = extract_owners_by_parcel(pdf_bytes)
-    parcels_text = extract_parcels_text(pdf_bytes)
-    fallback_owners = extract_owners_fallback_list(pdf_bytes)
+    parcel2owner   = extract_owners_by_parcel(pdf_bytes)
+    parcels_text   = extract_parcels_text(pdf_bytes)
+    fallback_owners= extract_owners_fallback_list(pdf_bytes)
 
     # Intentar deducir tu parcela (self) en texto de páginas 1–2
     guessed_self = None
@@ -365,7 +351,24 @@ def extract(
     except Exception:
         pass
 
-    # Conjunto de objetivos
+    # Si TEXT_ONLY=1, saltamos OCR por completo (evita timeouts 502)
+    if TEXT_ONLY:
+        linderos = {"norte": "", "sur": "", "oeste": "", "este": ""}
+        used = set()
+        idx = 0
+        order = ["norte","sur","oeste","este"]
+        for side in order:
+            while idx < len(fallback_owners) and fallback_owners[idx] in used:
+                idx += 1
+            if idx < len(fallback_owners):
+                linderos[side] = fallback_owners[idx]
+                used.add(fallback_owners[idx]); idx += 1
+        owners_detected = list(dict.fromkeys(list(parcel2owner.values()) + fallback_owners))[:8]
+        note = "Modo TEXT_ONLY activo: OCR desactivado para respuesta rápida."
+        dbg = {"TEXT_ONLY": True, "guessed_self": guessed_self, "parcels_text": parcels_text[:20]} if debug else None
+        return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
+
+    # Conjunto de objetivos para OCR
     target_parcels = set(parcels_text) | set(parcel2owner.keys())
     if guessed_self:
         target_parcels.add(guessed_self)
@@ -395,7 +398,7 @@ def extract(
             main_center = min([center_of(b) for b in self_boxes], key=lambda c: c[0]*c[0]+c[1]*c[1])
             used_center = "self_ocr"
         else:
-            mask_g, _mask_p = color_masks(bgr)
+            mask_g, _ = color_masks(bgr)
             mains = contours_centroids(mask_g, min_area=(400 if not FAST_MODE else 700))
             if mains:
                 main_center = (mains[0][0], mains[0][1])
@@ -430,8 +433,7 @@ def extract(
                         idx += 1
                     if idx < len(fallback_owners):
                         linderos[side] = fallback_owners[idx]
-                        used.add(fallback_owners[idx])
-                        idx += 1
+                        used.add(fallback_owners[idx]); idx += 1
 
         if not any(linderos.values()):
             note_parts.append("OCR sin coincidencias claras; afinaremos binarización/PSM y extracción de titulares.")
@@ -460,7 +462,7 @@ def extract(
 
     except Exception as e:
         owners_detected = list(dict.fromkeys(list(parcel2owner.values()) + fallback_owners))[:8]
-        dbg = {"exception": str(e), "FAST_MODE": FAST_MODE} if debug else None
+        dbg = {"exception": str(e), "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY} if debug else None
         return ExtractOut(
             linderos={"norte":"","sur":"","oeste":"","este":""},
             owners_detected=owners_detected,
@@ -472,3 +474,37 @@ def extract(
 def health():
     return {"ok": True}
 
+@app.get("/diag")
+def diag():
+    """Diagnóstico rápido dentro del contenedor: versiones de Tesseract/Poppler/cv2."""
+    def cmdout(cmd: List[str]) -> str:
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=5).decode(errors="ignore").strip()
+            return out.splitlines()[0]
+        except Exception as e:
+            return f"err: {e}"
+    try:
+        tess_v = cmdout(["tesseract", "--version"])
+    except Exception as e:
+        tess_v = f"err: {e}"
+    try:
+        pdfinfo_v = cmdout(["pdfinfo", "-v"])
+    except Exception as e:
+        pdfinfo_v = f"err: {e}"
+    try:
+        cv2_v = cv2.__version__
+    except Exception as e:
+        cv2_v = f"err: {e}"
+    try:
+        pytess_v = str(pytesseract.get_tesseract_version()) if hasattr(pytesseract,"get_tesseract_version") else "unknown"
+    except Exception as e:
+        pytess_v = f"err: {e}"
+    return {
+        "ok": True,
+        "FAST_MODE": FAST_MODE,
+        "TEXT_ONLY": TEXT_ONLY,
+        "tesseract": tess_v,
+        "pdfinfo": pdfinfo_v,
+        "cv2": cv2_v,
+        "pytesseract": pytess_v
+    }
