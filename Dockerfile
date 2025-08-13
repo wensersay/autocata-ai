@@ -1,19 +1,19 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# Dependencias del sistema para pdf2image (poppler), Tesseract y OpenCV headless
+# Paquetes del sistema necesarios para OCR/imagen
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    poppler-utils tesseract-ocr tesseract-ocr-spa \
-    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
-    && rm -rf /var/lib/apt/lists/*
+    tesseract-ocr poppler-utils libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
 
+# Dependencias Python
 WORKDIR /app
-COPY requirements.txt ./ 
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+# Código
+COPY . .
 
-ENV PYTHONUNBUFFERED=1
+# Puerto para Railway
 ENV PORT=8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
 
-# Escucha el puerto que asigne Railway; fallback 8000
-CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
