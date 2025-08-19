@@ -10,7 +10,7 @@ import pytesseract
 from PIL import Image
 import subprocess
 
-app = FastAPI(title="AutoCatastro AI", version="0.2.4-RUN4")
+app = FastAPI(title="AutoCatastro AI", version="0.2.4-RUN5")
 
 # -------- Flags/entorno --------
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
