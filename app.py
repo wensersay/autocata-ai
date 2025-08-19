@@ -10,7 +10,7 @@ import pytesseract
 from PIL import Image
 import subprocess
 
-app = FastAPI(title="AutoCatastro AI", version="0.2.4-RUN3")
+app = FastAPI(title="AutoCatastro AI", version="0.2.4-RUN4")
 
 # -------- Flags/entorno --------
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
@@ -470,9 +470,14 @@ def extract(
             debug=dbg
         )
 
+# ---- rutas para healthcheck de Railway ----
+@app.get("/")
+def root():
+    return {"ok": True, "path": "/", "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY}
+
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY}
 
 @app.get("/diag")
 def diag():
@@ -508,3 +513,4 @@ def diag():
         "cv2": cv2_v,
         "pytesseract": pytess_v
     }
+
