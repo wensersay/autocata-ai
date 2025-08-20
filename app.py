@@ -13,7 +13,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.0")
+app = FastAPI(title="AutoCatastro AI", version="0.3.1")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -114,36 +114,88 @@ def reconstruct_owner(lines: List[str]) -> str:
 
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
-    """Construye dict {parcela: titular} desde páginas ≥2 (texto estructurado)."""
+    """Construye dict {parcela: titular} leyendo las páginas ≥ 2.
+    Estrategia:
+      1) Detecta la parcela actual a partir de líneas con "... Parcela N".
+      2) Al ver "Titularidad principal" o la cabecera de la tabla, recoge 1–3
+         líneas en MAYÚSCULAS como nombre (evitando NIF/Domicilio/números).
+    """
     mapping: Dict[str, str] = {}
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
-            if pi == 0:  # saltar portada
-                continue
+            if pi == 0:
+                continue  # saltar portada
+
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-            lines = normalize_text(text).split("\n")
+            lines = normalize_text(text).split("
+")
+
+            curr_parcel: Optional[str] = None
             i = 0
             while i < len(lines):
-                up = lines[i].upper()
-                m = POLY_PARC_RE.search(up) or PARCEL_ONLY_RE.search(up)
-                if m:
-                    parcela = m.group(m.lastindex)
-                    blk: List[str] = []
+                raw = lines[i].strip()
+                up  = raw.upper()
+
+                # (1) Detectar "PARCELA N" y guardar N como parcela actual
+                if "PARCELA" in up:
+                    tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
+                    if tokens:
+                        curr_parcel = tokens[-1]
+                    i += 1
+                    continue
+
+                # (2) Al ver la cabecera de titularidad, saltar a los nombres
+                if ("TITULARIDAD PRINCIPAL" in up) or ("APELLIDOS NOMBRE" in up and "RAZON" in up):
                     j = i + 1
-                    while j < len(lines) and len(blk) < 4:
-                        raw = lines[j].strip()
-                        if not raw:
-                            if blk: break
-                            j += 1; continue
-                        if is_upper_name(raw):
-                            blk.append(raw); j += 1
-                        else:
+
+                    # Saltar filas cabecera/meta
+                    def is_meta(s: str) -> bool:
+                        U = s.upper().strip()
+                        return (
+                            U == "" or
+                            "APELLIDOS NOMBRE" in U or
+                            "RAZON SOCIAL" in U or
+                            "NIF" in U or
+                            "DOMICILIO" in U
+                        )
+
+                    while j < len(lines) and is_meta(lines[j]):
+                        j += 1
+
+                    # Tomar 1–3 líneas en mayúsculas para el nombre
+                    block: List[str] = []
+                    while j < len(lines):
+                        cand = lines[j].strip()
+                        U = cand.upper()
+                        if not cand:
+                            if block:
+                                break
+                            j += 1
+                            continue
+                        if ("NIF" in U) or ("DOMICILIO" in U) or any(ch.isdigit() for ch in cand):
                             break
-                    owner = reconstruct_owner(blk) if blk else ""
-                    if parcela and owner and parcela not in mapping:
-                        mapping[parcela] = owner
-                    i = j; continue
+                        if is_upper_name(cand):
+                            block.append(cand)
+                            j += 1
+                            if len(block) >= 3:
+                                break
+                            continue
+                        else:
+                            if block:
+                                break
+                            j += 1
+                            continue
+
+                    owner = reconstruct_owner(block) if block else ""
+                    if curr_parcel and owner and curr_parcel not in mapping:
+                        mapping[curr_parcel] = owner
+
+                    i = j
+                    continue
+
                 i += 1
+
     return mapping
 
 
@@ -366,5 +418,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
                           owners_detected=owners_detected,
                           note=note,
                           debug=dbg)
+
 
 
