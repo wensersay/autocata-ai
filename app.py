@@ -329,4 +329,3 @@ def preview(pdf_url: AnyHttpUrl):
 def health():
     return {"ok": True, "version": "0.3.0", "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY, "PAGE2_MAP": PAGE2_MAP}
 
-
