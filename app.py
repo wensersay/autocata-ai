@@ -1,19 +1,31 @@
 from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query
 from pydantic import BaseModel, AnyHttpUrl
-from starlette.responses import StreamingResponse, JSONResponse
-from typing import Dict, List, Optional, Tuple
+from starlette.responses import StreamingResponse
+from typing import Dict, List, Optional, Tuple, Union
 import requests, io, re, os, math
 import numpy as np
 import pdfplumber
-from pdf2image import convert_from_bytes
-from PIL import Image
-import cv2
-import pytesseract
+
+# ── Imports tolerantes (para que el healthcheck pase aunque falte algo) ──
+try:
+    from pdf2image import convert_from_bytes
+except Exception:
+    convert_from_bytes = None  # type: ignore
+try:
+    import cv2
+except Exception:
+    cv2 = None  # type: ignore
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None  # type: ignore
+
+from PIL import Image, ImageDraw, ImageFont
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.1")
+app = FastAPI(title="AutoCatastro AI", version="0.3.2")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -98,7 +110,9 @@ def reconstruct_owner(lines: List[str]) -> str:
     i = 0
     while i < len(toks):
         tok = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'']", "", toks[i])
-        if not tok: i += 1; continue
+        if not tok:
+            i += 1
+            continue
         # pegados típicos (A L VARELA → ALVARELA)
         if len(tok) <= 2 and i + 1 < len(toks):
             nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", toks[i+1])
@@ -128,6 +142,7 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
                 continue  # saltar portada
 
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+            # ✅ bugfix: split correcto
             lines = normalize_text(text).split("\n")
 
             curr_parcel: Optional[str] = None
@@ -199,10 +214,34 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Utilidades imagen / visión
+# ──────────────────────────────────────────────────────────────────────────────
+
+def image_to_png_bytes(img: Union[np.ndarray, Image.Image]) -> bytes:
+    """Convierte un np.ndarray BGR o PIL.Image en bytes PNG, con fallback si no hay cv2."""
+    bio = io.BytesIO()
+    if isinstance(img, np.ndarray):
+        if cv2 is not None:
+            ok, enc = cv2.imencode(".png", img)
+            if not ok:
+                raise RuntimeError("No se pudo codificar PNG (cv2).")
+            return enc.tobytes()
+        # fallback: convertir BGR→RGB y usar PIL
+        img_rgb = img[:, :, ::-1]
+        Image.fromarray(img_rgb).save(bio, format="PNG")
+        return bio.getvalue()
+    # PIL
+    img.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Visión por computador (página 2)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
+    if convert_from_bytes is None:
+        raise RuntimeError("pdf2image no disponible en el entorno.")
     dpi = 400 if FAST_MODE else 550
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
@@ -226,6 +265,8 @@ def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Devuelve (mask_verde_principal, mask_rosa_vecinos)."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV no disponible en el entorno.")
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     # Verde agua (parcela propia) – rangos amplios
     g_ranges = [
@@ -252,14 +293,19 @@ def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def contours_centroids(mask: np.ndarray, min_area: int = 250) -> List[Tuple[int,int,int]]:
+    if cv2 is None:
+        raise RuntimeError("OpenCV no disponible en el entorno.")
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < min_area: continue
+        if a < min_area: 
+            continue
         M = cv2.moments(c)
-        if M["m00"] == 0: continue
-        cx = int(M["m10"] / M["m00"]) ; cy = int(M["m01"] / M["m00"]) ;
+        if M["m00"] == 0:
+            continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
         out.append((cx, cy, int(a)))
     out.sort(key=lambda x: -x[2])
     return out
@@ -278,6 +324,8 @@ def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
 
 
 def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
+    if pytesseract is None:
+        return ""
     cfg = f"--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789"
     data = pytesseract.image_to_string(img, config=cfg) or ""
     digits = re.sub(r"\D+", "", data)
@@ -285,6 +333,8 @@ def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
 
 
 def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 110) -> str:
+    if cv2 is None:
+        return ""
     x, y = center
     h, w = bgr.shape[:2]
     half = box // 2
@@ -300,13 +350,16 @@ def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 11
     for p in (7, 6):
         for var in (bw, bwi):
             txt = ocr_digits(var, psm=p)
-            if txt: return txt
+            if txt:
+                return txt
     return ""
 
 
 def detect_neighbors_and_assign(bgr: np.ndarray,
                                 parcel2owner: Dict[str,str]) -> Tuple[Dict[str,str], dict, np.ndarray]:
     """Devuelve (linderos, debug, annotated_png_bgr)."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV no disponible en el entorno.")
     vis = bgr.copy()
     crop, (ox, oy) = crop_map(bgr)
     mg, mp = color_masks(crop)
@@ -353,7 +406,17 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"ok": True, "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY}
+    return {
+        "ok": True,
+        "version": app.version,
+        "FAST_MODE": FAST_MODE,
+        "TEXT_ONLY": TEXT_ONLY,
+        "deps": {
+            "pdf2image": convert_from_bytes is not None,
+            "cv2": cv2 is not None,
+            "pytesseract": pytesseract is not None
+        }
+    }
 
 
 @app.get("/preview", dependencies=[Depends(check_token)])
@@ -363,18 +426,16 @@ def preview_get(pdf_url: AnyHttpUrl = Query(...)):
         parcel2owner = extract_owners_map(pdf_bytes)
         bgr = page2_bgr(pdf_bytes)
         linderos, dbg, vis = detect_neighbors_and_assign(bgr, parcel2owner)
+        png = image_to_png_bytes(vis)
+        return StreamingResponse(io.BytesIO(png), media_type="image/png")
     except Exception as e:
-        # Si la visión falla, devuelve una mini-imagen en blanco con el error
-        err = str(e)
-        blank = np.zeros((240, 640, 3), np.uint8)
-        cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        ok, png = cv2.imencode(".png", blank)
-        return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
-
-    ok, png = cv2.imencode(".png", vis)
-    if not ok:
-        raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
-    return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
+        # Fallback: mini-imagen con el error, usando PIL (sin depender de cv2)
+        err = f"ERR: {str(e)[:90]}"
+        img = Image.new("RGB", (800, 240), (24, 24, 24))
+        draw = ImageDraw.Draw(img)
+        draw.text((16, 100), err, fill=(255, 255, 255))
+        png = image_to_png_bytes(img)
+        return StreamingResponse(io.BytesIO(png), media_type="image/png")
 
 
 @app.post("/preview", dependencies=[Depends(check_token)])
@@ -403,10 +464,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         bgr = page2_bgr(pdf_bytes)
         linderos, vdbg, _vis = detect_neighbors_and_assign(bgr, parcel2owner)
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
-        note_parts: List[str] = []
-        if not any(linderos.values()):
-            note_parts.append("OCR sin coincidencias claras; afinaremos ROI y mapeo de titulares.")
-        note = " ".join(note_parts) if note_parts else None
+        note = None if any(linderos.values()) else "OCR sin coincidencias claras; afinaremos ROI y mapeo de titulares."
         dbg = {"owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]), **vdbg} if debug else None
         return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
     except Exception as e:
