@@ -128,8 +128,7 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
                 continue  # saltar portada
 
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-            lines = normalize_text(text).split("
-")
+            lines = normalize_text(text).split("\n")
 
             curr_parcel: Optional[str] = None
             i = 0
