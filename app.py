@@ -79,6 +79,23 @@ def is_upper_name(line: str) -> bool:
     if sum(ch.isdigit() for ch in line) >= 3:
         return False
     return bool(UPPER_NAME_RE.match(line))
+    
+def strip_after_nif(s: str) -> str:
+    """
+    Si la línea trae el DNI/NIF en la misma línea que el nombre,
+    cortamos la línea justo antes del NIF. También recortamos colas numéricas
+    (p.ej. comienzos de domicilio) para quedarnos con el nombre limpio.
+    """
+    m = DNI_RE.search(s)
+    if m:
+        return s[:m.start()].rstrip()
+
+    # Si hay números al final (direcciones), corta a partir del primer dígito “de cola”
+    m2 = re.search(r"\s\d[^\n]*$", s)
+    if m2:
+        return s[:m2.start()].rstrip()
+
+    return s
 
 def reconstruct_owner(lines: List[str]) -> str:
     """Une 1–3 líneas en mayúsculas en un nombre razonable."""
@@ -112,17 +129,19 @@ def reconstruct_owner(lines: List[str]) -> str:
     return name
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
-    """{parcela: titular} leyendo páginas ≥ 2.
-       Mejora: si la línea de nombre contiene dígitos (empieza domicilio),
-       tomamos solo el **prefijo** en mayúsculas **antes** del primer dígito.
-       Además, si tras la primera línea hay una segunda línea con una palabra
-       en mayúsculas (p.ej. 'LUIS') y luego ya números, la añadimos.
+    """Construye dict {parcela: titular} leyendo las páginas ≥ 2.
+    Estrategia:
+      1) Detecta la parcela actual a partir de líneas con '... Parcela N'.
+      2) Al ver la zona de 'Titularidad' / cabecera de tabla, recoge 1–3
+         líneas en MAYÚSCULAS como nombre, limpiando NIF y colas numéricas.
     """
     mapping: Dict[str, str] = {}
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
             if pi == 0:
                 continue  # saltar portada
+
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             lines = normalize_text(text).split("\n")
 
@@ -132,7 +151,7 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
                 raw = lines[i].strip()
                 up  = raw.upper()
 
-                # Detectar "PARCELA N"
+                # (1) Detectar 'PARCELA N' y guardar N como parcela actual
                 if "PARCELA" in up:
                     tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
                     if tokens:
@@ -140,58 +159,55 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
                     i += 1
                     continue
 
-                # Detectar cabecera de titularidad
-                if ("TITULARIDAD PRINCIPAL" in up) or ("APELLIDOS NOMBRE" in up and "RAZON" in up):
+                # (2) Detectar comienzo del bloque de titulares
+                #    - 'TITULARIDAD' en la línea, o
+                #    - línea que mencione APELLIDOS y NOMBRE (aunque 'RAZON' esté en otra línea)
+                if ("TITULARIDAD" in up) or ("APELLIDOS" in up and "NOMBRE" in up):
                     j = i + 1
 
+                    # Saltar filas cabecera/meta (pueden venir repartidas en varias líneas)
                     def is_meta(s: str) -> bool:
                         U = s.upper().strip()
                         return (
                             U == "" or
-                            "APELLIDOS NOMBRE" in U or
-                            "RAZON SOCIAL" in U or
-                            "NIF" in U or
-                            "DOMICILIO" in U
+                            "APELLIDOS" in U or "NOMBRE" in U or
+                            "RAZON" in U or "SOCIAL" in U or
+                            "NIF" in U or "DOMICILIO" in U
                         )
 
                     while j < len(lines) and is_meta(lines[j]):
                         j += 1
 
+                    # Tomar 1–3 líneas de nombre (depurando NIF/dígitos de cola)
                     block: List[str] = []
-                    # 1ª línea de nombre (o prefijo antes de números)
-                    if j < len(lines):
+                    while j < len(lines):
                         cand = lines[j].strip()
-                        U = cand.upper()
-                        if cand:
-                            if any(ch.isdigit() for ch in cand):
-                                # tomar sólo el prefijo “nombre” antes de números
-                                m = re.match(r"^[A-ZÁÉÍÓÚÜÑ\s\.'\-]+", U)
-                                pref = (m.group(0).strip() if m else "")
-                                if pref and is_upper_name(pref):
-                                    block.append(pref)
-                                # en cuanto aparecen números, paramos el bloque
-                            else:
-                                if is_upper_name(cand):
-                                    block.append(cand)
-                        j += 1
+                        if not cand:
+                            if block:
+                                break
+                            j += 1
+                            continue
 
-                    # 2ª línea opcional (captura “LUIS” si está sola y luego ya hay números)
-                    if j < len(lines) and len(block) <= 2:
-                        cand2 = lines[j].strip()
-                        U2 = cand2.upper()
-                        if cand2:
-                            # si empieza con una palabra en mayúsculas y enseguida vienen números,
-                            # añadimos solo esa palabra inicial
-                            if any(ch.isdigit() for ch in cand2):
-                                m2 = re.match(r"^[A-ZÁÉÍÓÚÜÑ]+(?:\s+[A-ZÁÉÍÓÚÜÑ]+)?", U2)
-                                pref2 = (m2.group(0).strip() if m2 else "")
-                                # evitar añadir “NIF DOMICILIO”
-                                if pref2 and pref2 not in ("NIF", "DOMICILIO") and is_upper_name(pref2):
-                                    block.append(pref2)
-                            else:
-                                if is_upper_name(cand2):
-                                    block.append(cand2)
-                        j += 1
+                        cand_clean = strip_after_nif(cand)
+                        # si tras limpiar queda vacío, seguimos
+                        if not cand_clean:
+                            if block:
+                                break
+                            j += 1
+                            continue
+
+                        if is_upper_name(cand_clean):
+                            block.append(cand_clean)
+                            j += 1
+                            if len(block) >= 3:
+                                break
+                            continue
+                        else:
+                            # si veníamos acumulando y esta ya no parece nombre, cerramos
+                            if block:
+                                break
+                            j += 1
+                            continue
 
                     owner = reconstruct_owner(block) if block else ""
                     if curr_parcel and owner and curr_parcel not in mapping:
@@ -201,6 +217,7 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
                     continue
 
                 i += 1
+
     return mapping
 
 # ──────────────────────────────────────────────────────────────────────────────
