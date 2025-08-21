@@ -27,6 +27,18 @@ def check_token(x_autocata_token: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Constantes OpenCV con fallback (algunos builds no traen THRESH_OTSU)
+# ──────────────────────────────────────────────────────────────────────────────
+CV_THRESH_BINARY      = int(getattr(cv2, "THRESH_BINARY", 0))
+CV_THRESH_BINARY_INV  = int(getattr(cv2, "THRESH_BINARY_INV", 1))
+CV_THRESH_OTSU        = int(getattr(cv2, "THRESH_OTSU", 0))  # si no existe → 0 (sin OTSU)
+
+def thr_flags(base_flag: int, use_otsu: bool = True) -> int:
+    if use_otsu and CV_THRESH_OTSU:
+        return int(base_flag) | int(CV_THRESH_OTSU)
+    return int(base_flag)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Modelos I/O
 # ──────────────────────────────────────────────────────────────────────────────
 class ExtractIn(BaseModel):
@@ -41,20 +53,16 @@ class ExtractOut(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades PDF / Texto
 # ──────────────────────────────────────────────────────────────────────────────
-UPPER_NAME_RE   = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
-DNI_RE          = re.compile(r"\b\d{8}[A-Z]\b")
-POLY_PARC_RE    = re.compile(r"POL[ÍI]GONO\s+(\d+).*?PARCELA\s+(\d+)", re.IGNORECASE)
-PARCEL_ONLY_RE  = re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
-NAME_HEAD_RE    = re.compile(r"^([A-ZÁÉÍÓÚÜÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÜÑ]{2,}){1,4})\b")
-ONE_UPPER_WORD  = re.compile(r"^([A-ZÁÉÍÓÚÜÑ]{2,12})(?:\s|$)")
+UPPER_NAME_RE  = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+DNI_RE         = re.compile(r"\b\d{8}[A-Z]\b")
+POLY_PARC_RE   = re.compile(r"POL[ÍI]GONO\s+(\d+).*?PARCELA\s+(\d+)", re.IGNORECASE)
+PARCEL_ONLY_RE = re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
 
 STOP_IN_NAME = (
     "POLÍGONO", "POLIGONO", "PARCELA", "[", "]", "(", ")",
     "COORDENADAS", "ETRS", "HUSO", "ESCALA", "TITULARIDAD",
     "VALOR CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION"
 )
-
-ADDR_HINTS = (" NIF", "NIF ", " DOMICILIO", " CL ", " AV ", " LG ", " PL:", " PT:", " ESC ", " ES:", " KM ", " C/")
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -74,129 +82,96 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\n{2,}", "\n", s)
     return s.strip()
 
-def is_meta_line(s: str) -> bool:
-    U = s.upper().strip()
-    if U == "": return True
-    if "APELLIDOS NOMBRE" in U or "RAZON SOCIAL" in U: return True
-    if "NIF" in U or "DOMICILIO" in U: return True
-    return False
+def is_upper_name(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+    for bad in STOP_IN_NAME:
+        if bad in line.upper():
+            return False
+    if sum(ch.isdigit() for ch in line) >= 3:
+        return False
+    return bool(UPPER_NAME_RE.match(line))
 
-def looks_like_location_line(s: str) -> bool:
-    U = s.upper()
-    # Localizaciones suelen traer corchetes o puntos entre palabras
-    if "[" in U or "]" in U: return True
-    if "." in U: return True
-    return False
+def reconstruct_owner(lines: List[str]) -> str:
+    """Une 1–4 líneas en mayúsculas en un nombre razonable."""
+    toks: List[str] = []
+    for ln in lines:
+        ln = re.sub(r"\s+", " ", ln.strip())
+        if ln:
+            toks.extend(ln.split(" "))
+    clean = []
+    i = 0
+    while i < len(toks):
+        tok = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'']", "", toks[i])
+        if not tok:
+            i += 1; continue
+        # pegados típicos (A L VARELA → ALVARELA)
+        if len(tok) <= 2 and i + 1 < len(toks):
+            nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", toks[i+1])
+            if nxt and len(nxt) >= 3:
+                clean.append(tok + nxt); i += 2; continue
+        clean.append(tok); i += 1
+    name = " ".join(clean)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    return name
 
-def extract_name_head(line: str) -> Optional[str]:
-    """
-    Devuelve el 'cabezado' de nombre (2–5 palabras en mayúsculas) al inicio de la línea.
-    Ej: 'RODRIGUEZ ALVAREZ JOSE 38526627V ...' -> 'RODRIGUEZ ALVAREZ JOSE'
-    """
-    m = NAME_HEAD_RE.search(line.upper().strip())
-    if not m:
-        return None
-    head = m.group(1).strip()
-    # Evitar que el 'cabezado' sea una localización accidental
-    if looks_like_location_line(head):
-        return None
-    return head
-
-def maybe_append_split_second_name(next_line: str) -> Optional[str]:
-    """
-    Si la siguiente línea empieza con UNA palabra en mayúsculas (p.ej. 'LUIS')
-    y luego ya aparecen dígitos o pinta de dirección, devolvemos esa palabra
-    para pegarla al final del nombre.
-    """
-    U = next_line.upper().strip()
-    # No aceptamos si trae corchetes/puntos (suele ser localización)
-    if looks_like_location_line(U):
-        return None
-    m = ONE_UPPER_WORD.match(U)
-    if not m:
-        return None
-    word = m.group(1)
-    # ¿El resto de la línea parece dirección o DNI?
-    rest = U[len(word):]
-    if any(h in rest for h in ADDR_HINTS) or any(ch.isdigit() for ch in rest):
-        return word
-    # También si la línea es MUY corta (solo esa palabra)
-    if rest.strip() == "":
-        return word
-    return None
+def join_upper_lines(lines: List[str], start: int, max_lines: int = 4) -> List[str]:
+    """Une hasta 4 líneas consecutivas en mayúsculas (sin números) desde start."""
+    block: List[str] = []
+    j = start
+    while j < len(lines) and len(block) < max_lines:
+        cand = lines[j].strip()
+        U = cand.upper()
+        if not cand:
+            if block: break
+            j += 1; continue
+        if "NIF" in U or "DOMICILIO" in U or any(ch.isdigit() for ch in cand):
+            break
+        if is_upper_name(cand):
+            block.append(cand); j += 1
+        else:
+            if block: break
+            j += 1
+    return block
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
-    """
-    Construye dict {parcela: titular} leyendo las páginas ≥ 2.
-    Estrategia robusta frente a localizaciones:
-      - Tras 'PARCELA N', inspecciona ~12 líneas.
-      - Ignora cabeceras/meta y líneas con '[' ']' o '.' (localización).
-      - Extrae el 'cabezado de nombre' (2–5 palabras mayúsculas) y
-        si la línea siguiente empieza con UNA palabra en mayúsculas y
-        luego ya hay números/dirección, la añade (caso '... JOSE' + 'LUIS Pl:...').
-    """
+    """Construye dict {parcela: titular} leyendo las páginas ≥2."""
     mapping: Dict[str, str] = {}
-
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
-            if pi == 0:
-                continue  # saltamos portada
-
+            if pi == 0:  # portada
+                continue
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             lines = normalize_text(text).split("\n")
-
             curr_parcel: Optional[str] = None
             i = 0
             while i < len(lines):
-                up = lines[i].upper().strip()
+                up = lines[i].strip().upper()
 
-                # Detectar PARCELA
+                # (1) Detectar "PARCELA N"
                 if "PARCELA" in up:
-                    # Guardar número de parcela "actual"
                     tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
                     if tokens:
                         curr_parcel = tokens[-1]
+                    i += 1; continue
 
-                    # Buscar titular en las ~12 siguientes líneas o hasta próxima PARCELA
+                # (2) Titularidad / cabecera de tabla
+                if ("TITULARIDAD PRINCIPAL" in up) or ("APELLIDOS NOMBRE" in up and "RAZON" in up):
                     j = i + 1
-                    while j < len(lines) and j <= i + 12:
-                        raw = lines[j].strip()
-                        U   = raw.upper()
-
-                        if "PARCELA" in U:
-                            break  # empieza el siguiente bloque
-
-                        if is_meta_line(raw):
-                            j += 1
-                            continue
-
-                        if looks_like_location_line(raw):
-                            j += 1
-                            continue
-
-                        # Intentar extraer el cabezado del nombre en esta línea
-                        head = extract_name_head(raw)
-                        if head:
-                            # ¿La siguiente línea añade un segundo nombre suelto?
-                            tail = ""
-                            if j + 1 < len(lines):
-                                add = maybe_append_split_second_name(lines[j+1])
-                                if add:
-                                    tail = " " + add
-                                    j += 1  # consumimos esa línea
-
-                            owner = (head + tail).strip()
-                            if curr_parcel and owner and curr_parcel not in mapping:
-                                mapping[curr_parcel] = owner
-                            break
-
+                    # saltar cabeceras
+                    def is_meta(s: str) -> bool:
+                        U = s.upper().strip()
+                        return (U == "" or "APELLIDOS NOMBRE" in U or "RAZON SOCIAL" in U or "NIF" in U or "DOMICILIO" in U)
+                    while j < len(lines) and is_meta(lines[j]):
                         j += 1
-
-                    i = j
-                    continue
+                    block = join_upper_lines(lines, j, max_lines=4)
+                    owner = reconstruct_owner(block) if block else ""
+                    if curr_parcel and owner and curr_parcel not in mapping:
+                        mapping[curr_parcel] = owner
+                    i = j + len(block); continue
 
                 i += 1
-
     return mapping
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,27 +200,21 @@ def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Devuelve (mask_verde_principal, mask_rosa_vecinos)."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Verde agua (parcela propia) – rangos amplios
     g_ranges = [
-        (np.array([35,  20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
-        (np.array([86,  15, 50], np.uint8), np.array([100,255, 255], np.uint8)),
+        (np.array([35,20,50], np.uint8),  np.array([85,255,255], np.uint8)),
+        (np.array([86,15,50], np.uint8),  np.array([100,255,255], np.uint8)),
     ]
-    # Rosa palo (vecinos) – h≈0 o h≈160
     p_ranges = [
-        (np.array([160, 20, 80], np.uint8), np.array([179,255,255], np.uint8)),
-        (np.array([  0, 20, 80], np.uint8), np.array([ 10,255,255], np.uint8)),
+        (np.array([160,20,80], np.uint8), np.array([179,255,255], np.uint8)),
+        (np.array([  0,20,80], np.uint8), np.array([ 10,255,255], np.uint8)),
     ]
     mg = np.zeros(hsv.shape[:2], np.uint8)
     for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     mp = np.zeros(hsv.shape[:2], np.uint8)
     for lo, hi in p_ranges: mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
-
-    k3 = np.ones((3,3), np.uint8)
-    k5 = np.ones((5,5), np.uint8)
-    mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3)
-    mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
-    mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3)
-    mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
+    k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
+    mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3);  mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
+    mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3);  mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
     return mg, mp
 
 def contours_centroids(mask: np.ndarray, min_area: int = 250) -> List[Tuple[int,int,int]]:
@@ -256,7 +225,7 @@ def contours_centroids(mask: np.ndarray, min_area: int = 250) -> List[Tuple[int,
         if a < min_area: continue
         M = cv2.moments(c)
         if M["m00"] == 0: continue
-        cx = int(M["m10"] / M["m00"]) ; cy = int(M["m01"] / M["m00"]) ;
+        cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
         out.append((cx, cy, int(a)))
     out.sort(key=lambda x: -x[2])
     return out
@@ -265,11 +234,10 @@ def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
-    # Norte arriba, Sur abajo, Este derecha, Oeste izquierda
-    ang = math.degrees(math.atan2(-(sy), sx))
-    if -45 <= ang <= 45: return "este"
-    if 45 < ang <= 135:  return "norte"
-    if -135 <= ang < -45:return "sur"
+    ang = math.degrees(math.atan2(-(sy), sx))  # norte arriba
+    if -45 <= ang <= 45:  return "este"
+    if 45 < ang <= 135:   return "norte"
+    if -135 <= ang < -45: return "sur"
     return "oeste"
 
 def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
@@ -277,6 +245,18 @@ def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
     data = pytesseract.image_to_string(img, config=cfg) or ""
     digits = re.sub(r"\D+", "", data)
     return digits
+
+def binarize_safe(gray: np.ndarray, inv: bool = False) -> np.ndarray:
+    """Binariza con OTSU si existe, si no, con umbral fijo."""
+    flag = thr_flags(CV_THRESH_BINARY_INV if inv else CV_THRESH_BINARY, use_otsu=True)
+    try:
+        _ret, bw = cv2.threshold(gray, 0, 255, flag)
+        return bw
+    except Exception:
+        # fallback: sin OTSU
+        flag_no = thr_flags(CV_THRESH_BINARY_INV if inv else CV_THRESH_BINARY, use_otsu=False)
+        _ret, bw = cv2.threshold(gray, 127, 255, flag_no)
+        return bw
 
 def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 110) -> str:
     x, y = center
@@ -289,12 +269,13 @@ def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 11
         return ""
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-    _, bw  = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.OTSU)
-    _, bwi = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.OTSU)
+    bw  = binarize_safe(g, inv=False)
+    bwi = binarize_safe(g, inv=True)
     for p in (7, 6):
         for var in (bw, bwi):
             txt = ocr_digits(var, psm=p)
-            if txt: return txt
+            if txt:
+                return txt
     return ""
 
 def detect_neighbors_and_assign(bgr: np.ndarray,
@@ -333,11 +314,7 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
         if owner:
             linderos[sd] = owner
 
-    dbg = {
-        "main_center": main_abs,
-        "neighbors": len(neighs),
-        "side2parcel": side2parcel,
-    }
+    dbg = {"main_center": main_abs, "neighbors": len(neighs), "side2parcel": side2parcel}
     return linderos, dbg, vis
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -354,7 +331,9 @@ def preview_get(pdf_url: AnyHttpUrl = Query(...)):
         parcel2owner = extract_owners_map(pdf_bytes)
         bgr = page2_bgr(pdf_bytes)
         linderos, dbg, vis = detect_neighbors_and_assign(bgr, parcel2owner)
+        _ = linderos, dbg  # solo para evitar "unused"
     except Exception as e:
+        # Si la visión falla, devuelve una mini-imagen en blanco con el error
         err = str(e)
         blank = np.zeros((240, 640, 3), np.uint8)
         cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
@@ -374,7 +353,7 @@ def preview_post(data: ExtractIn = Body(...)):
 def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
 
-    # 1) Texto (páginas ≥2): parcela → titular (nuevo parser)
+    # 1) Texto (páginas ≥2): parcela → titular
     parcel2owner = extract_owners_map(pdf_bytes)
 
     if TEXT_ONLY:
@@ -392,7 +371,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         linderos, vdbg, _vis = detect_neighbors_and_assign(bgr, parcel2owner)
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
         note = None if any(linderos.values()) else "OCR sin coincidencias claras; afinaremos ROI y mapeo de titulares."
-        dbg = ({"owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]), **vdbg} if debug else None)
+        dbg = {"owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]), **vdbg} if debug else None
         return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
     except Exception as e:
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
@@ -402,4 +381,5 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
                           owners_detected=owners_detected,
                           note=note,
                           debug=dbg)
+
 
