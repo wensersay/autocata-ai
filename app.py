@@ -13,7 +13,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.3")
+app = FastAPI(title="AutoCatastro AI", version="0.3.4")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -41,17 +41,15 @@ class ExtractOut(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades PDF / Texto
 # ──────────────────────────────────────────────────────────────────────────────
-UPPER_NAME_RE  = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
-ONLY_LETTERS_RE= re.compile(r"^[A-ZÁÉÍÓÚÜÑ\-\.'´`]+$", re.UNICODE)
-DNI_RE         = re.compile(r"\b\d{8}[A-Z]\b")
-PARCEL_ONLY_RE = re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
+UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+DNI_RE        = re.compile(r"\b\d{8}[A-Z]\b")
+PARCEL_ONLY_RE= re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
 
 STOP_IN_NAME = (
     "POLÍGONO", "POLIGONO", "PARCELA", "[", "]", "(", ")",
     "COORDENADAS", "ETRS", "HUSO", "ESCALA", "TITULARIDAD",
     "VALOR CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION",
-    "RELACIÓN DE PARCELAS", "RELACION DE PARCELAS",
-    "REFERENCIA CATASTRAL"
+    "REFERENCIA CATASTRAL", "RELACIÓN DE PARCELAS", "RELACION DE PARCELAS"
 )
 
 def fetch_pdf_bytes(url: str) -> bytes:
@@ -80,91 +78,82 @@ def is_upper_name(line: str) -> bool:
     for bad in STOP_IN_NAME:
         if bad in U:
             return False
-    # si hay demasiados dígitos, probablemente es dirección
     if sum(ch.isdigit() for ch in line) >= 3:
         return False
     return bool(UPPER_NAME_RE.match(line))
 
-def reconstruct_owner_from_tokens(tokens: List[str]) -> str:
-    """Limpia y une tokens (permite compuestos: DE/DEL/DA/DO/Y/SAN/SANTA)."""
-    ALLOW = {"DE","DEL","DA","DO","DOS","DAS","Y","E","SAN","SANTA","D'","DI","DU"}
+def leading_upper_segment(line: str) -> str:
+    """
+    Extrae el segmento inicial en MAYÚSCULAS aun si después hay números/dirección.
+    Ej.: 'LUIS Pl:04 Pt:02 ...' -> 'LUIS'
+    Devuelve '' si no hay un inicio razonable en mayúsculas.
+    """
+    s = line.strip()
+    if not s:
+        return ""
+    U = s.upper()
+    # Evita líneas de metadatos evidentes
+    if any(tag in U for tag in ("APELLIDOS NOMBRE", "RAZON SOCIAL", "NIF", "DOMICILIO")):
+        return ""
+    # Segmento inicial de letras/espacios/puntos/apóstrofes/guiones
+    m = re.match(r"^([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\.\-\' ]{1,})", U)
+    if not m:
+        return ""
+    seg = m.group(1).strip()
+    # Cortar si el segmento capta bloques raros
+    seg = re.sub(r"\s{2,}", " ", seg).strip()
+    # Si el segmento es demasiado corto o parece topónimo puro, descártalo
+    if len(seg) < 3:
+        return ""
+    return seg
+
+def reconstruct_owner(lines: List[str]) -> str:
+    """Une 1–4 líneas/segmentos en mayúsculas en un nombre razonable."""
+    toks: List[str] = []
+    for ln in lines:
+        # Preferimos el segmento inicial en mayúsculas aunque haya números después.
+        seg = leading_upper_segment(ln)
+        if not seg:
+            # como respaldo, si toda la línea parece nombre en mayúsculas sin números
+            if is_upper_name(ln):
+                seg = ln.strip()
+        if seg:
+            toks.extend(seg.split(" "))
     clean: List[str] = []
-    for t in tokens:
-        t = t.strip(".´`'")
-        if not t: 
+    i = 0
+    while i < len(toks):
+        tok = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'']", "", toks[i])
+        if not tok:
+            i += 1
             continue
-        if ONLY_LETTERS_RE.match(t):
-            clean.append(t)
-        else:
-            # ejemplo: "D'ALMEIDA" -> mantener letras y apóstrofo inicial
-            t2 = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'´`]", "", t)
-            if t2 and ONLY_LETTERS_RE.match(t2):
-                clean.append(t2)
-    # compacta conectores permitidos si aparecen aislados
-    out: List[str] = []
-    for t in clean:
-        if t in ALLOW or len(t) >= 2:
-            out.append(t)
-    name = " ".join(out)
-    name = re.sub(r"\s{2,}", " ", name).strip()
-    return name
-
-def extract_name_window(lines: List[str], start_idx: int) -> str:
-    """
-    Desde la cabecera de titularidad/tabla, recorre hasta 12 líneas,
-    extrayendo *del comienzo de cada línea* los tokens alfabéticos (A–Z con acentos)
-    hasta el primer token 'no-letras' (con dígitos, ':', '[', etc.).
-    Esto capta casos como:
-        L1: RODRIGUEZ ALVAREZ JOSE 38526627V AV ...
-        L2: LUIS Pl:04 Pt:02 ...
-    → 'RODRIGUEZ ALVAREZ JOSE LUIS'
-    """
-    tokens: List[str] = []
-    steps = 0
-    i = start_idx + 1
-    while i < len(lines) and steps < 12 and len(tokens) < 8:
-        raw = lines[i].strip()
-        U = raw.upper()
-
-        # Cortes duros de sección / fin de bloque nombres
-        if any(stop in U for stop in STOP_IN_NAME) and ("TITULARIDAD" not in U and "APELLIDOS NOMBRE" not in U and "RAZON SOCIAL" not in U):
-            break
-
-        # Salta líneas claramente de cabecera de tabla o metadatos
-        if ("APELLIDOS NOMBRE" in U) or ("RAZON SOCIAL" in U):
-            i += 1; steps += 1; continue
-
-        # Toma tokens alfabeticos desde el inicio de la línea hasta el primer token "no-letras"
-        line_tokens = []
-        for tok in raw.split():
-            if ONLY_LETTERS_RE.match(tok.upper()):
-                line_tokens.append(tok.upper())
+        # unir pegados típicos (A L VARELA → ALVARELA)
+        if len(tok) <= 2 and i + 1 < len(toks):
+            nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", toks[i+1])
+            if nxt and len(nxt) >= 3:
+                clean.append(tok + nxt)
+                i += 2
                 continue
-            # si el primer token no-letras llega, paramos esta línea
-            break
-
-        if line_tokens:
-            tokens.extend(line_tokens)
-        else:
-            # si ya veníamos acumulando y esta línea no aporta, cortamos
-            if tokens:
-                break
-
+        clean.append(tok)
         i += 1
-        steps += 1
-
-    name = reconstruct_owner_from_tokens(tokens)
-    return name
+    name = " ".join(clean)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    # Limitar longitud para no comernos la dirección
+    return name[:80].strip()
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
     """
-    {parcela: titular} desde páginas ≥ 2.
-    • Detecta '... PARCELA N' (suele ir junto a Localización).
-    • Al ver 'TITULARIDAD PRINCIPAL' o cabecera de tabla ('APELLIDOS NOMBRE'/'RAZON SOCIAL'),
-      abre una ventana de 12 líneas y captura tokens alfabéticos del inicio de cada línea
-      hasta tropezar con el primer token no-alfabético (dígitos, 'Pl:', etc.).
+    Construye dict {parcela: titular} desde páginas ≥2.
+    • Detecta '... Parcela N' (en la línea de Localización).
+    • Tras 'Titularidad principal' o cabecera de tabla, escanea una ventana
+      de hasta 12 líneas y recolecta hasta 4 segmentos en MAYÚSCULAS
+      (aunque haya NIF/Domicilio intermedios), con cortes por metacabeceras.
     """
     mapping: Dict[str, str] = {}
+    META_STOPS = (
+        "REFERENCIA CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION",
+        "RELACIÓN DE PARCELAS", "RELACION DE PARCELAS", "TITULARIDAD PRINCIPAL"
+    )
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
             if pi == 0:
@@ -176,24 +165,47 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
             i = 0
             while i < len(lines):
                 raw = lines[i].strip()
-                U = raw.upper()
+                up  = raw.upper()
 
-                # (1) PARCELA N
-                if "PARCELA" in U:
-                    nums = [t for t in U.replace(",", " ").split() if t.isdigit()]
-                    if nums:
-                        curr_parcel = nums[-1]
+                # (1) Detectar "PARCELA N"
+                if "PARCELA" in up:
+                    tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
+                    if tokens:
+                        curr_parcel = tokens[-1]
 
-                # (2) Cabecera de titulares
-                if ("TITULARIDAD PRINCIPAL" in U) or (("APELLIDOS NOMBRE" in U) and ("RAZON" in U)):
-                    owner = extract_name_window(lines, i)
-                    if curr_parcel and owner and curr_parcel not in mapping:
-                        mapping[curr_parcel] = owner
-                    # avanzar un poco para no re-parsar lo mismo
-                    i += 4
+                # (2) Cabecera de titularidad / tabla
+                if ("TITULARIDAD PRINCIPAL" in up) or ("APELLIDOS NOMBRE" in up and "RAZON" in up):
+                    j = i + 1
+                    picked: List[str] = []
+                    steps = 0
+                    while j < len(lines) and steps < 12 and len(picked) < 4:
+                        cand = lines[j].strip()
+                        U = cand.upper()
+
+                        # Cortes duros si aparecen otras secciones
+                        if any(s in U for s in META_STOPS):
+                            break
+                        # Saltar cabeceras de tabla, pero NO cortar el bucle
+                        if ("APELLIDOS NOMBRE" in U) or ("RAZON SOCIAL" in U):
+                            j += 1; steps += 1; continue
+
+                        seg = leading_upper_segment(cand)
+                        if seg:
+                            picked.append(seg)
+
+                        j += 1; steps += 1
+
+                    owner = reconstruct_owner(picked) if picked else ""
+                    # sanity: evita meter topónimos típicos
+                    if owner and not re.search(r"\b(LUGO|MADRID|BARCELONA|CORUÑA|SEVILLA|VALENCIA|BIZKAIA|ALAVA|GIPUZKOA|ZARAGOZA|MALAGA)\b", owner):
+                        if curr_parcel and curr_parcel not in mapping:
+                            mapping[curr_parcel] = owner
+
+                    i = j
                     continue
 
                 i += 1
+
     return mapping
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -285,12 +297,24 @@ def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 11
         return ""
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-    # Soporta builds sin OTSU
-    def thr(img, inv=False):
-        flags = (THRESH_BINARY_INV if inv else THRESH_BINARY) | (THRESH_OTSU if THRESH_OTSU else 0)
-        _, bw = cv2.threshold(img, 0 if THRESH_OTSU else 127, 255, flags)
-        return bw
-    variants = [thr(g, inv=False), thr(g, inv=True)]
+    # Fallback si OTSU no existe en la build
+    TH_BIN = int(getattr(cv2, "THRESH_BINARY", 0))
+    TH_INV = int(getattr(cv2, "THRESH_BINARY_INV", 0))
+    TH_OT  = int(getattr(cv2, "THRESH_OTSU", 0))
+    _, bw  = cv2.threshold(g, 0 if TH_OT else 127, 255, TH_BIN | (TH_OT if TH_OT else 0))
+    _, bwi = cv2.threshold(g, 0 if TH_OT else 127, 255, TH_INV | (TH_OT if TH_OT else 0))
+    # Muestrear también con pequeños desplazamientos para capturar números fuera del centroide del polígono
+    variants = [bw, bwi]
+    for dx in (0, 20, -20, 35, -35):
+        for dy in (0, 20, -20, 35, -35):
+            xr0, yr0 = max(0, x0+dx), max(0, y0+dy)
+            xr1, yr1 = min(w, x1+dx), min(h, y1+dy)
+            if xr1 <= xr0 or yr1 <= yr0: continue
+            sub = g[(yr0- y0):(yr1- y0), (xr0- x0):(xr1- x0)]
+            if sub.size:
+                _, sbw  = cv2.threshold(sub, 0 if TH_OT else 127, 255, TH_BIN | (TH_OT if TH_OT else 0))
+                _, sbwi = cv2.threshold(sub, 0 if TH_OT else 127, 255, TH_INV | (TH_OT if TH_OT else 0))
+                variants.extend([sbw, sbwi])
     for p in (7, 6):
         for var in variants:
             txt = ocr_digits(var, psm=p)
@@ -345,11 +369,11 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
 @app.get("/health")
 def health():
     return {
-        "ok": True, 
-        "version": app.version, 
-        "FAST_MODE": FAST_MODE, 
+        "ok": True,
+        "version": app.version,
+        "FAST_MODE": FAST_MODE,
         "TEXT_ONLY": TEXT_ONLY,
-        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
+        "cv2_flags": {"OTSU": bool(getattr(cv2, "THRESH_OTSU", 0))}
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
@@ -360,11 +384,10 @@ def preview_get(pdf_url: AnyHttpUrl = Query(...)):
         bgr = page2_bgr(pdf_bytes)
         linderos, dbg, vis = detect_neighbors_and_assign(bgr, parcel2owner)
     except Exception as e:
-        # mini-imagen con error (evita 5xx)
+        # Devolver mini-imagen con el error (evita 5xx en healthcheck)
         err = str(e)
         blank = np.zeros((240, 640, 3), np.uint8)
-        cv2.putText(blank, f"ERR: {err[:60]}", (10,120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
         ok, png = cv2.imencode(".png", blank)
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
@@ -381,21 +404,19 @@ def preview_post(data: ExtractIn = Body(...)):
 def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
 
-    # 1) Texto (páginas ≥2): parcela → titular (robusto a nombres multilínea)
+    # 1) Texto (páginas ≥2): parcela → titular
     parcel2owner = extract_owners_map(pdf_bytes)
 
     if TEXT_ONLY:
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
         note = "Modo TEXT_ONLY activo: mapa desactivado."
-        dbg = {"TEXT_ONLY": True, "owners_by_parcel_sample": dict(list(parcel2owner.items())[:8])} if debug else None
-        return ExtractOut(
-            linderos={"norte":"","sur":"","oeste":"","este":""},
-            owners_detected=owners_detected,
-            note=note,
-            debug=dbg
-        )
+        dbg = {"TEXT_ONLY": True, "owners_by_parcel_sample": dict(list(parcel2owner.items())[:6])} if debug else None
+        return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
+                          owners_detected=owners_detected,
+                          note=note,
+                          debug=dbg)
 
-    # 2) Visión (pág. 2): localizar principal/vecinos y asignar lados → titulares
+    # 2) Visión (pág. 2)
     try:
         bgr = page2_bgr(pdf_bytes)
         linderos, vdbg, _vis = detect_neighbors_and_assign(bgr, parcel2owner)
@@ -407,11 +428,8 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
         note = f"Excepción visión/OCR: {e}"
         dbg = {"exception": str(e)} if debug else None
-        return ExtractOut(
-            linderos={"norte":"","sur":"","oeste":"","este":""},
-            owners_detected=owners_detected,
-            note=note,
-            debug=dbg
-        )
+        return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
+                          owners_detected=owners_detected, note=note, debug=dbg)
+
 
 
