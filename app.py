@@ -13,7 +13,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.5")
+app = FastAPI(title="AutoCatastro AI", version="0.3.6")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -52,10 +52,9 @@ STOP_IN_NAME = (
     "REFERENCIA CATASTRAL"
 )
 
-# Palabras frecuentes de dirección/lugar para cortar (no exhaustivo; genérico)
 ADDR_TOKENS_RE = re.compile(
     r"(?:\bNIF\b|\bDOMICIL(?:IO|IO:)?\b|\bCL\b|C\/|\bCALLE\b|\bAV(?:\.|)\b|\bBLOQUE\b|\bESC\.?\b|\bPORTAL\b|\bPL[:\s]|"
-    r"\bPT[:\s]|\bPISO\b|\bDPTO\b|\bLG\b|\bLUGO\b|\bBARCELONA\b|\bMADRID\b|[0-9]{3,}|\b\d{8}[A-Z]\b)",
+    r"\bPT[:\s]|\bPISO\b|\bDPTO\b|\bLG\b|\b[0-9]{3,}|\b\d{8}[A-Z]\b|\[[^\]]*\])",
     re.IGNORECASE
 )
 
@@ -78,92 +77,100 @@ def normalize_text(s: str) -> str:
     return s.strip()
 
 def strip_after_nif_or_digits(line: str) -> str:
-    """Corta la línea en cuanto detecta NIF, cadenas numéricas largas o tokens de dirección,
-       y normaliza a MAYÚSCULAS, dejando solo letras/espacios/.-'"""
     m = ADDR_TOKENS_RE.search(line)
     if m:
         line = line[:m.start()]
     line = line.upper()
-    # limpiar basura residual
     line = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s\.'\-]", " ", line)
     line = re.sub(r"\s{2,}", " ", line).strip()
     return line
 
 def looks_like_name_piece(s: str, allow_single: bool = False) -> bool:
-    """Heurística: <= 26 chars, mayúsculas, empieza por letra acentuada; 
-       si no allow_single, exigir >= 2 tokens o longitud >= 6."""
-    if not s:
+    if not s: return False
+    if len(s) > 26: return False
+    if not UPPER_NAME_RE.match(s): return False
+    if not allow_single and (len(s.split()) < 2 and len(s) < 6):
         return False
-    if len(s) > 26:
-        return False
-    if not UPPER_NAME_RE.match(s):
-        return False
-    if not allow_single:
-        if len(s.split()) < 2 and len(s) < 6:
-            return False
     return True
 
 def reconstruct_owner(pieces: List[str]) -> str:
-    """Une piezas ya normalizadas (MAYÚSCULAS) en un nombre."""
     if not pieces:
         return ""
-    s = " ".join(pieces)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
+    return re.sub(r"\s{2,}", " ", " ".join(pieces)).strip()
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
     """
     Construye dict {parcela: titular} desde páginas ≥ 2.
-    • Detecta '... Parcela N' (en la línea de Localización).
-    • Tras 'Titularidad principal' o cabecera de tabla, escanea una ventana
-      de hasta 12 líneas y recoge hasta 3 piezas de nombre (<=26 chars),
-      aplicando SIEMPRE strip_after_nif_or_digits antes de validar.
-      Permite segunda/tercera línea de 1 sola palabra (p.ej. 'LUIS').
+    - Ancla por 'Polígono ... Parcela N'.
+    - En la siguiente ventana (≤30 líneas):
+        • Si encuentra un NIF → toma lo anterior como nombre y, si la línea
+          siguiente es una palabra corta en mayúsculas (p.ej. 'LUIS'), la añade.
+        • Si detecta cabecera ('Titularidad principal' o 'Apellidos Nombre / Razón social'),
+          recoge hasta 3 líneas válidas.
     """
     mapping: Dict[str, str] = {}
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
             if pi == 0:
-                continue  # saltar portada
+                continue
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             lines = normalize_text(text).split("\n")
 
-            curr_parcel: Optional[str] = None
             i = 0
             while i < len(lines):
                 raw = lines[i].strip()
                 up  = raw.upper()
 
-                # (1) Detectar "PARCELA N"
-                if "PARCELA" in up:
-                    nums = [t for t in up.replace(",", " ").split() if t.isdigit()]
-                    if nums:
-                        curr_parcel = nums[-1]  # última cifra de la línea
-                    # no hacemos continue; seguimos por si en la línea siguiente viene la tabla
-
-                # (2) Cabecera de titularidad/tabla
-                if ("TITULARIDAD PRINCIPAL" in up) or ("APELLIDOS NOMBRE" in up and "RAZON" in up):
-                    pieces: List[str] = []
-                    j, steps = i + 1, 0
-                    while j < len(lines) and steps < 12 and len(pieces) < 3:
-                        cand = lines[j].strip()
-                        # Si la línea estaba entre corchetes → suele ser provincia/nota
-                        if cand.startswith("[") and cand.endswith("]"):
-                            j += 1; steps += 1; continue
-                        cleaned = strip_after_nif_or_digits(cand)
-                        if cleaned:
-                            allow_single = len(pieces) >= 1
-                            if looks_like_name_piece(cleaned, allow_single=allow_single):
-                                pieces.append(cleaned)
-                        j += 1; steps += 1
-
-                    owner = reconstruct_owner(pieces)
-                    if curr_parcel and owner and curr_parcel not in mapping:
-                        mapping[curr_parcel] = owner
-                    i = j
+                m_parc = PARCEL_ONLY_RE.search(up)
+                if not m_parc:
+                    i += 1
                     continue
 
-                i += 1
+                curr_parcel = m_parc.group(1)
+                pieces: List[str] = []
+                j = i + 1
+                end = min(len(lines), i + 30)
+
+                while j < end and len(pieces) < 3:
+                    cand = lines[j].strip()
+                    upj  = cand.upper()
+
+                    # Si empieza otro bloque, detenemos búsqueda
+                    if PARCEL_ONLY_RE.search(upj) or "REFERENCIA CATASTRAL" in upj:
+                        break
+
+                    # Caso 1: NIF en la misma línea → nombre antes del NIF
+                    m_dni = DNI_RE.search(upj)
+                    if m_dni:
+                        before = cand[:m_dni.start()]
+                        name1  = strip_after_nif_or_digits(before)
+                        if looks_like_name_piece(name1, allow_single=False):
+                            pieces.append(name1)
+                            # mirar posible segunda línea (nombre compuesto separado)
+                            if j + 1 < len(lines):
+                                nxt = strip_after_nif_or_digits(lines[j+1])
+                                if looks_like_name_piece(nxt, allow_single=True):
+                                    pieces.append(nxt)
+                        break
+
+                    # Caso 2: Cabecera de tabla detectada
+                    if "TITULARIDAD PRINCIPAL" in upj or ("APELLIDOS NOMBRE" in upj and ("RAZON" in upj or "RAZÓN" in upj)):
+                        k, steps = j + 1, 0
+                        while k < len(lines) and steps < 12 and len(pieces) < 3:
+                            c2 = strip_after_nif_or_digits(lines[k])
+                            if looks_like_name_piece(c2, allow_single=(len(pieces) >= 1)):
+                                pieces.append(c2)
+                            k += 1; steps += 1
+                        break
+
+                    j += 1
+
+                owner = reconstruct_owner(pieces)
+                if curr_parcel and owner and curr_parcel not in mapping:
+                    mapping[curr_parcel] = owner
+
+                i = j if j > i else i + 1
 
     return mapping
 
@@ -256,11 +263,10 @@ def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 11
         return ""
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-    # OTSU si está disponible en la build
-    flags_bin = THRESH_BINARY | (THRESH_OTSU if THRESH_OTSU else 0)
-    flags_inv = THRESH_BINARY_INV | (THRESH_OTSU if THRESH_OTSU else 0)
-    _, bw  = cv2.threshold(g, 0 if THRESH_OTSU else 127, 255, flags_bin)
-    _, bwi = cv2.threshold(g, 0 if THRESH_OTSU else 127, 255, flags_inv)
+    flags_bin = cv2.THRESH_BINARY | (cv2.THRESH_OTSU if hasattr(cv2, "THRESH_OTSU") else 0)
+    flags_inv = cv2.THRESH_BINARY_INV | (cv2.THRESH_OTSU if hasattr(cv2, "THRESH_OTSU") else 0)
+    _, bw  = cv2.threshold(g, 0 if hasattr(cv2, "THRESH_OTSU") else 127, 255, flags_bin)
+    _, bwi = cv2.threshold(g, 0 if hasattr(cv2, "THRESH_OTSU") else 127, 255, flags_inv)
     for p in (7, 6):
         for var in (bw, bwi):
             txt = ocr_digits(var, psm=p)
@@ -269,7 +275,6 @@ def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 11
 
 def detect_neighbors_and_assign(bgr: np.ndarray,
                                 parcel2owner: Dict[str,str]) -> Tuple[Dict[str,str], dict, np.ndarray]:
-    """Devuelve (linderos, debug, annotated_png_bgr)."""
     vis = bgr.copy()
     crop, (ox, oy) = crop_map(bgr)
     mg, mp = color_masks(crop)
@@ -301,11 +306,7 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
         if owner:
             linderos[sd] = owner
 
-    dbg = {
-        "main_center": main_abs,
-        "neighbors": len(neighs),
-        "side2parcel": side2parcel,
-    }
+    dbg = {"main_center": main_abs, "neighbors": len(neighs), "side2parcel": side2parcel}
     return linderos, dbg, vis
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -314,7 +315,7 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
 @app.get("/health")
 def health():
     return {"ok": True, "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY,
-            "cv2_flags":{"OTSU": bool(THRESH_OTSU)}}
+            "cv2_flags":{"OTSU": bool(getattr(cv2, "THRESH_OTSU", 0))}}
 
 @app.get("/preview", dependencies=[Depends(check_token)])
 def preview_get(pdf_url: AnyHttpUrl = Query(...)):
@@ -324,7 +325,6 @@ def preview_get(pdf_url: AnyHttpUrl = Query(...)):
         bgr = page2_bgr(pdf_bytes)
         linderos, dbg, vis = detect_neighbors_and_assign(bgr, parcel2owner)
     except Exception as e:
-        # Devolver mini-imagen con el error (evita 5xx en healthcheck)
         err = str(e)
         blank = np.zeros((240, 640, 3), np.uint8)
         cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
@@ -363,7 +363,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
 
         dbg = None
         if debug:
-            # Muestra una pequeña muestra del texto de p.2 para diagnósticos
             try:
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     p2 = pdf.pages[1].extract_text(x_tolerance=2, y_tolerance=2) or ""
@@ -380,6 +379,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         dbg = {"exception": str(e)} if debug else None
         return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
+
 
 
 
