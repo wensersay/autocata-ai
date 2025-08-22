@@ -381,3 +381,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
                           owners_detected=owners_detected, note=note, debug=dbg)
 
 
+
