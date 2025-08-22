@@ -13,7 +13,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.6")
+app = FastAPI(title="AutoCatastro AI", version="0.3.7")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -52,9 +52,15 @@ STOP_IN_NAME = (
     "REFERENCIA CATASTRAL"
 )
 
+# Nombres cortos permitidos para segunda línea suelta (evita “LEM”)
+SHORT_GIVEN_NAMES = {
+    "JOSE","JOSÉ","LUIS","ANA","IVAN","IVÁN","RAUL","RAÚL","ENRI","NOE","NOÉ",
+    "JUAN","Mª","MAR","NEUS","MARÍ","PAU","ORI","SOL","ROSA","ERIC","ERIC"
+}
+
 ADDR_TOKENS_RE = re.compile(
     r"(?:\bNIF\b|\bDOMICIL(?:IO|IO:)?\b|\bCL\b|C\/|\bCALLE\b|\bAV(?:\.|)\b|\bBLOQUE\b|\bESC\.?\b|\bPORTAL\b|\bPL[:\s]|"
-    r"\bPT[:\s]|\bPISO\b|\bDPTO\b|\bLG\b|\b[0-9]{3,}|\b\d{8}[A-Z]\b|\[[^\]]*\])",
+    r"\bPT[:\s]|\bPISO\b|\bDPTO\b|\bLG\b|\bPO\.?\b|\bCP\b|\b[0-9]{3,}|\b\d{8}[A-Z]\b|\[[^\]]*\])",
     re.IGNORECASE
 )
 
@@ -76,11 +82,12 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\n{2,}", "\n", s)
     return s.strip()
 
-def strip_after_nif_or_digits(line: str) -> str:
+def clean_name_fragment(line: str) -> str:
+    # corta antes de NIF/dirección/códigos
     m = ADDR_TOKENS_RE.search(line)
-    if m:
-        line = line[:m.start()]
+    if m: line = line[:m.start()]
     line = line.upper()
+    # deja solo letras, espacios y signos de nombre
     line = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s\.'\-]", " ", line)
     line = re.sub(r"\s{2,}", " ", line).strip()
     return line
@@ -89,8 +96,9 @@ def looks_like_name_piece(s: str, allow_single: bool = False) -> bool:
     if not s: return False
     if len(s) > 26: return False
     if not UPPER_NAME_RE.match(s): return False
-    if not allow_single and (len(s.split()) < 2 and len(s) < 6):
-        return False
+    if not allow_single:
+        # exigir al menos dos palabras o ≥6 chars
+        if (len(s.split()) < 2 and len(s) < 6): return False
     return True
 
 def reconstruct_owner(pieces: List[str]) -> str:
@@ -100,13 +108,12 @@ def reconstruct_owner(pieces: List[str]) -> str:
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
     """
-    Construye dict {parcela: titular} desde páginas ≥ 2.
-    - Ancla por 'Polígono ... Parcela N'.
-    - En la siguiente ventana (≤30 líneas):
-        • Si encuentra un NIF → toma lo anterior como nombre y, si la línea
-          siguiente es una palabra corta en mayúsculas (p.ej. 'LUIS'), la añade.
-        • Si detecta cabecera ('Titularidad principal' o 'Apellidos Nombre / Razón social'),
-          recoge hasta 3 líneas válidas.
+    Dict {parcela: titular} desde páginas ≥ 2.
+    • Ancla en “... Parcela N”.
+    • En ≤30 líneas siguientes:
+        - Si hay NIF en la línea → toma lo anterior como nombre y
+          añade la siguiente línea solo si es nombre corto válido (no “LEM”).
+        - Si detecta cabecera de tabla → recoge hasta 3 líneas de nombre.
     """
     mapping: Dict[str, str] = {}
 
@@ -119,9 +126,7 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
 
             i = 0
             while i < len(lines):
-                raw = lines[i].strip()
-                up  = raw.upper()
-
+                up = lines[i].strip().upper()
                 m_parc = PARCEL_ONLY_RE.search(up)
                 if not m_parc:
                     i += 1
@@ -136,29 +141,31 @@ def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
                     cand = lines[j].strip()
                     upj  = cand.upper()
 
-                    # Si empieza otro bloque, detenemos búsqueda
+                    # ¿comienza otro bloque?
                     if PARCEL_ONLY_RE.search(upj) or "REFERENCIA CATASTRAL" in upj:
                         break
 
-                    # Caso 1: NIF en la misma línea → nombre antes del NIF
+                    # Caso 1: NIF en la línea
                     m_dni = DNI_RE.search(upj)
                     if m_dni:
                         before = cand[:m_dni.start()]
-                        name1  = strip_after_nif_or_digits(before)
+                        name1  = clean_name_fragment(before)
                         if looks_like_name_piece(name1, allow_single=False):
                             pieces.append(name1)
-                            # mirar posible segunda línea (nombre compuesto separado)
+                            # ¿segunda línea corta tipo "LUIS"?
                             if j + 1 < len(lines):
-                                nxt = strip_after_nif_or_digits(lines[j+1])
-                                if looks_like_name_piece(nxt, allow_single=True):
+                                nxt = clean_name_fragment(lines[j+1])
+                                # aceptar solo si (>=4 letras) o está en la lista de nombres cortos
+                                if (len(nxt.split()) == 1 and (len(nxt) >= 4 or nxt in SHORT_GIVEN_NAMES)) \
+                                   or (len(nxt.split()) >= 2 and looks_like_name_piece(nxt, allow_single=True)):
                                     pieces.append(nxt)
                         break
 
-                    # Caso 2: Cabecera de tabla detectada
+                    # Caso 2: Cabecera de tabla
                     if "TITULARIDAD PRINCIPAL" in upj or ("APELLIDOS NOMBRE" in upj and ("RAZON" in upj or "RAZÓN" in upj)):
                         k, steps = j + 1, 0
                         while k < len(lines) and steps < 12 and len(pieces) < 3:
-                            c2 = strip_after_nif_or_digits(lines[k])
+                            c2 = clean_name_fragment(lines[k])
                             if looks_like_name_piece(c2, allow_single=(len(pieces) >= 1)):
                                 pieces.append(c2)
                             k += 1; steps += 1
@@ -379,7 +386,5 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         dbg = {"exception": str(e)} if debug else None
         return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
-
-
 
 
