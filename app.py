@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query
 from pydantic import BaseModel, AnyHttpUrl
 from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 import requests, io, re, os, math
 import numpy as np
 import pdfplumber
@@ -13,7 +14,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.7")
+app = FastAPI(title="AutoCatastro AI", version="0.3.8")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -41,27 +42,15 @@ class ExtractOut(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades PDF / Texto
 # ──────────────────────────────────────────────────────────────────────────────
-UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
-DNI_RE        = re.compile(r"\b\d{8}[A-Z]\b")
-PARCEL_ONLY_RE= re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
+UPPER_NAME_RE  = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+DNI_RE         = re.compile(r"\b\d{8}[A-Z]\b")
+PARCEL_ONLY_RE = re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
 
 STOP_IN_NAME = (
     "POLÍGONO", "POLIGONO", "PARCELA", "[", "]", "(", ")",
     "COORDENADAS", "ETRS", "HUSO", "ESCALA", "TITULARIDAD",
     "VALOR CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION",
     "REFERENCIA CATASTRAL"
-)
-
-# Nombres cortos permitidos para segunda línea suelta (evita “LEM”)
-SHORT_GIVEN_NAMES = {
-    "JOSE","JOSÉ","LUIS","ANA","IVAN","IVÁN","RAUL","RAÚL","ENRI","NOE","NOÉ",
-    "JUAN","Mª","MAR","NEUS","MARÍ","PAU","ORI","SOL","ROSA","ERIC","ERIC"
-}
-
-ADDR_TOKENS_RE = re.compile(
-    r"(?:\bNIF\b|\bDOMICIL(?:IO|IO:)?\b|\bCL\b|C\/|\bCALLE\b|\bAV(?:\.|)\b|\bBLOQUE\b|\bESC\.?\b|\bPORTAL\b|\bPL[:\s]|"
-    r"\bPT[:\s]|\bPISO\b|\bDPTO\b|\bLG\b|\bPO\.?\b|\bCP\b|\b[0-9]{3,}|\b\d{8}[A-Z]\b|\[[^\]]*\])",
-    re.IGNORECASE
 )
 
 def fetch_pdf_bytes(url: str) -> bytes:
@@ -82,104 +71,116 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\n{2,}", "\n", s)
     return s.strip()
 
-def clean_name_fragment(line: str) -> str:
-    # corta antes de NIF/dirección/códigos
-    m = ADDR_TOKENS_RE.search(line)
-    if m: line = line[:m.start()]
-    line = line.upper()
-    # deja solo letras, espacios y signos de nombre
-    line = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s\.'\-]", " ", line)
-    line = re.sub(r"\s{2,}", " ", line).strip()
-    return line
+def is_upper_name(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+    U = line.upper()
+    for bad in STOP_IN_NAME:
+        if bad in U:
+            return False
+    if sum(ch.isdigit() for ch in line) >= 3:
+        return False
+    return bool(UPPER_NAME_RE.match(line))
 
-def looks_like_name_piece(s: str, allow_single: bool = False) -> bool:
-    if not s: return False
-    if len(s) > 26: return False
-    if not UPPER_NAME_RE.match(s): return False
-    if not allow_single:
-        # exigir al menos dos palabras o ≥6 chars
-        if (len(s.split()) < 2 and len(s) < 6): return False
-    return True
-
-def reconstruct_owner(pieces: List[str]) -> str:
-    if not pieces:
-        return ""
-    return re.sub(r"\s{2,}", " ", " ".join(pieces)).strip()
+def reconstruct_owner(lines: List[str]) -> str:
+    """Une 1–3 líneas en mayúsculas en un nombre razonable."""
+    toks: List[str] = []
+    for ln in lines:
+        ln = re.sub(r"\s+", " ", ln.strip())
+        if ln:
+            toks.extend(ln.split(" "))
+    clean = []
+    i = 0
+    while i < len(toks):
+        tok = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'']", "", toks[i])
+        if not tok:
+            i += 1
+            continue
+        # pegados típicos (A L VARELA → ALVARELA)
+        if len(tok) <= 2 and i + 1 < len(toks):
+            nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", toks[i+1])
+            if nxt and len(nxt) >= 3:
+                clean.append(tok + nxt)
+                i += 2
+                continue
+        clean.append(tok)
+        i += 1
+    name = " ".join(clean)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    return name
 
 def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
     """
-    Dict {parcela: titular} desde páginas ≥ 2.
-    • Ancla en “... Parcela N”.
-    • En ≤30 líneas siguientes:
-        - Si hay NIF en la línea → toma lo anterior como nombre y
-          añade la siguiente línea solo si es nombre corto válido (no “LEM”).
-        - Si detecta cabecera de tabla → recoge hasta 3 líneas de nombre.
+    Construye dict {parcela: titular} desde páginas ≥2.
+    • Detecta '... Parcela N' (en la línea de Localización).
+    • Tras 'Titularidad principal' o cabecera de tabla, escanea una ventana
+      de hasta 10 líneas y recoge hasta 3 líneas en MAYÚSCULAS (saltando
+      NIF/Domicilio/líneas vacías). Esto capta casos como '... JOSE'
+      en una línea y 'LUIS' varias líneas después.
     """
     mapping: Dict[str, str] = {}
+    META_STOPS = ("REFERENCIA CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION",
+                  "RELACIÓN DE PARCELAS", "RELACION DE PARCELAS", "TITULARIDAD PRINCIPAL")
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
             if pi == 0:
-                continue
+                continue  # saltar portada
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             lines = normalize_text(text).split("\n")
 
+            curr_parcel: Optional[str] = None
             i = 0
             while i < len(lines):
-                up = lines[i].strip().upper()
-                m_parc = PARCEL_ONLY_RE.search(up)
-                if not m_parc:
-                    i += 1
+                raw = lines[i].strip()
+                up  = raw.upper()
+
+                # (1) Detectar "PARCELA N"
+                if "PARCELA" in up:
+                    tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
+                    if tokens:
+                        curr_parcel = tokens[-1]
+
+                # (2) Encontrar cabecera de titularidad / tabla
+                if ("TITULARIDAD PRINCIPAL" in up) or ("APELLIDOS NOMBRE" in up and "RAZON" in up):
+                    j = i + 1
+                    picked: List[str] = []
+                    steps = 0
+                    while j < len(lines) and steps < 10 and len(picked) < 3:
+                        cand = lines[j].strip()
+                        U = cand.upper()
+                        # Cortes duros
+                        if any(s in U for s in META_STOPS):
+                            break
+                        # Saltar cabeceras de tabla y números, pero NO cortar el bucle
+                        if ("APELLIDOS NOMBRE" in U) or ("RAZON SOCIAL" in U) or ("NIF" in U) or ("DOMICILIO" in U):
+                            j += 1; steps += 1; continue
+                        if is_upper_name(cand):
+                            picked.append(cand)
+                        j += 1; steps += 1
+
+                    owner = reconstruct_owner(picked) if picked else ""
+                    if curr_parcel and owner and curr_parcel not in mapping:
+                        mapping[curr_parcel] = owner
+                    i = j
                     continue
 
-                curr_parcel = m_parc.group(1)
-                pieces: List[str] = []
-                j = i + 1
-                end = min(len(lines), i + 30)
-
-                while j < end and len(pieces) < 3:
-                    cand = lines[j].strip()
-                    upj  = cand.upper()
-
-                    # ¿comienza otro bloque?
-                    if PARCEL_ONLY_RE.search(upj) or "REFERENCIA CATASTRAL" in upj:
-                        break
-
-                    # Caso 1: NIF en la línea
-                    m_dni = DNI_RE.search(upj)
-                    if m_dni:
-                        before = cand[:m_dni.start()]
-                        name1  = clean_name_fragment(before)
-                        if looks_like_name_piece(name1, allow_single=False):
-                            pieces.append(name1)
-                            # ¿segunda línea corta tipo "LUIS"?
-                            if j + 1 < len(lines):
-                                nxt = clean_name_fragment(lines[j+1])
-                                # aceptar solo si (>=4 letras) o está en la lista de nombres cortos
-                                if (len(nxt.split()) == 1 and (len(nxt) >= 4 or nxt in SHORT_GIVEN_NAMES)) \
-                                   or (len(nxt.split()) >= 2 and looks_like_name_piece(nxt, allow_single=True)):
-                                    pieces.append(nxt)
-                        break
-
-                    # Caso 2: Cabecera de tabla
-                    if "TITULARIDAD PRINCIPAL" in upj or ("APELLIDOS NOMBRE" in upj and ("RAZON" in upj or "RAZÓN" in upj)):
-                        k, steps = j + 1, 0
-                        while k < len(lines) and steps < 12 and len(pieces) < 3:
-                            c2 = clean_name_fragment(lines[k])
-                            if looks_like_name_piece(c2, allow_single=(len(pieces) >= 1)):
-                                pieces.append(c2)
-                            k += 1; steps += 1
-                        break
-
-                    j += 1
-
-                owner = reconstruct_owner(pieces)
-                if curr_parcel and owner and curr_parcel not in mapping:
-                    mapping[curr_parcel] = owner
-
-                i = j if j > i else i + 1
+                i += 1
 
     return mapping
+
+def sample_page2_text(pdf_bytes: bytes, max_lines: int = 26) -> List[str]:
+    """Devuelve una muestra de líneas de la página 2 (útil para depuración)."""
+    out: List[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if len(pdf.pages) >= 2:
+                txt = pdf.pages[1].extract_text(x_tolerance=2, y_tolerance=2) or ""
+                out = normalize_text(txt).split("\n")[:max_lines]
+    except Exception:
+        pass
+    return out
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OpenCV helpers (fallbacks seguros)
@@ -214,10 +215,12 @@ def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # Verde agua (parcela propia)
     g_ranges = [
         (np.array([35,  20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
         (np.array([86,  15, 50], np.uint8), np.array([100,255,255], np.uint8)),
     ]
+    # Rosa (vecinos)
     p_ranges = [
         (np.array([160, 20, 80], np.uint8), np.array([179,255,255], np.uint8)),
         (np.array([  0, 20, 80], np.uint8), np.array([ 10,255,255], np.uint8)),
@@ -259,33 +262,58 @@ def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
     data = pytesseract.image_to_string(img, config=cfg) or ""
     return re.sub(r"\D+", "", data)
 
-def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 110) -> str:
-    x, y = center
+# ── NUEVO: OCR robusto con votación (variantes de umbral/psm y leves offsets) ──
+def _ocr_digit_variants(gray: np.ndarray) -> List[str]:
+    out = []
+    has_otsu = hasattr(cv2, "THRESH_OTSU")
+    flags_bin = cv2.THRESH_BINARY | (cv2.THRESH_OTSU if has_otsu else 0)
+    flags_inv = cv2.THRESH_BINARY_INV | (cv2.THRESH_OTSU if has_otsu else 0)
+    thr = 0 if has_otsu else 127
+
+    for tflag in (flags_bin, flags_inv):
+        _, bw = cv2.threshold(gray, thr, 255, tflag)
+        for psm in (7, 6):
+            txt = ocr_digits(bw, psm=psm)
+            if txt:
+                out.append(txt)
+    return out
+
+def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], base_box: int = 110) -> str:
+    """Lee dígitos cerca de 'center' con votación (varios tamaños y ligeros desplazamientos)."""
     h, w = bgr.shape[:2]
-    half = box // 2
-    x0, y0 = max(0, x - half), max(0, y - half)
-    x1, y1 = min(w, x + half), min(h, y + half)
-    crop = bgr[y0:y1, x0:x1]
-    if crop.size == 0:
+    xs = [0, +8, -8]     # pequeños offsets X/Y para capturar nºs descentrados
+    ys = [0, -8, +8]
+    sizes = [max(70, base_box-30), base_box]
+
+    votes: Counter = Counter()
+    for dx in xs:
+        for dy in ys:
+            for box in sizes:
+                x, y = center[0] + dx, center[1] + dy
+                half = box // 2
+                x0, y0 = max(0, x - half), max(0, y - half)
+                x1, y1 = min(w, x + half), min(h, y + half)
+                crop = bgr[y0:y1, x0:x1]
+                if crop.size == 0:
+                    continue
+                g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
+                for num in _ocr_digit_variants(g):
+                    votes[num] += 1
+
+    if not votes:
         return ""
-    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-    flags_bin = cv2.THRESH_BINARY | (cv2.THRESH_OTSU if hasattr(cv2, "THRESH_OTSU") else 0)
-    flags_inv = cv2.THRESH_BINARY_INV | (cv2.THRESH_OTSU if hasattr(cv2, "THRESH_OTSU") else 0)
-    _, bw  = cv2.threshold(g, 0 if hasattr(cv2, "THRESH_OTSU") else 127, 255, flags_bin)
-    _, bwi = cv2.threshold(g, 0 if hasattr(cv2, "THRESH_OTSU") else 127, 255, flags_inv)
-    for p in (7, 6):
-        for var in (bw, bwi):
-            txt = ocr_digits(var, psm=p)
-            if txt: return txt
-    return ""
+    best_num, _ = votes.most_common(1)[0]
+    return best_num
 
 def detect_neighbors_and_assign(bgr: np.ndarray,
                                 parcel2owner: Dict[str,str]) -> Tuple[Dict[str,str], dict, np.ndarray]:
+    """Devuelve (linderos, debug, annotated_png_bgr)."""
     vis = bgr.copy()
     crop, (ox, oy) = crop_map(bgr)
     mg, mp = color_masks(crop)
 
+    # Centro principal: mayor componente verde
     mains = contours_centroids(mg, min_area=(400 if FAST_MODE else 250))
     if not mains:
         return {"norte":"","sur":"","este":"","oeste":""}, {"reason":"no_main_green"}, vis
@@ -293,27 +321,55 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
     main_abs = (main_cx + ox, main_cy + oy)
     cv2.circle(vis, main_abs, 10, (0,255,0), -1)
 
+    # Vecinos rosas
     neighs = contours_centroids(mp, min_area=(280 if FAST_MODE else 180))
-    side2parcel: Dict[str, str] = {}
+
+    # Acumulamos candidatos por lado para elegir por distancia
+    candidates_by_side: Dict[str, List[Tuple[str, Tuple[int,int], float]]] = {}
 
     max_neigh = 24 if FAST_MODE else 48
     for (cx, cy, _a) in neighs[:max_neigh]:
         abs_pt = (cx + ox, cy + oy)
         cv2.circle(vis, abs_pt, 8, (0,0,255), -1)
         sd = side_of(main_abs, abs_pt)
-        num = read_parcel_number_at(bgr, abs_pt, box=(90 if FAST_MODE else 120))
-        if num and sd not in side2parcel:
-            side2parcel[sd] = num
-            cv2.putText(vis, f"{sd[:1].upper()}:{num}", (abs_pt[0]+6, abs_pt[1]-6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
 
+        # Lectura robusta (votación)
+        raw_num = read_parcel_number_at(bgr, abs_pt, base_box=(90 if FAST_MODE else 120))
+        if not raw_num:
+            continue
+
+        # Lista blanca: solo números presentes en parcel2owner
+        if raw_num not in parcel2owner:
+            stripped = raw_num.lstrip("0")
+            if not (stripped and stripped in parcel2owner):
+                continue
+            raw_num = stripped
+
+        # distancia al centro (para romper empates dentro del lado)
+        d2 = float((abs_pt[0]-main_abs[0])**2 + (abs_pt[1]-main_abs[1])**2)
+        candidates_by_side.setdefault(sd, []).append((raw_num, abs_pt, d2))
+
+    side2parcel: Dict[str, str] = {}
+    for sd, items in candidates_by_side.items():
+        # Elegimos el candidato más cercano al centro
+        best = min(items, key=lambda t: t[2])
+        num, pt, _ = best
+        side2parcel[sd] = num
+        cv2.putText(vis, f"{sd[:1].upper()}:{num}", (pt[0]+6, pt[1]-6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
+
+    # Mapear a titulares
     linderos = {"norte":"","sur":"","este":"","oeste":""}
     for sd, num in side2parcel.items():
         owner = parcel2owner.get(num, "")
         if owner:
             linderos[sd] = owner
 
-    dbg = {"main_center": main_abs, "neighbors": len(neighs), "side2parcel": side2parcel}
+    dbg = {
+        "main_center": main_abs,
+        "neighbors": len(neighs),
+        "side2parcel": side2parcel,
+    }
     return linderos, dbg, vis
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -321,8 +377,13 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"ok": True, "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY,
-            "cv2_flags":{"OTSU": bool(getattr(cv2, "THRESH_OTSU", 0))}}
+    return {
+        "ok": True,
+        "version": app.version,
+        "FAST_MODE": FAST_MODE,
+        "TEXT_ONLY": TEXT_ONLY,
+        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
+    }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
 def preview_get(pdf_url: AnyHttpUrl = Query(...)):
@@ -332,9 +393,11 @@ def preview_get(pdf_url: AnyHttpUrl = Query(...)):
         bgr = page2_bgr(pdf_bytes)
         linderos, dbg, vis = detect_neighbors_and_assign(bgr, parcel2owner)
     except Exception as e:
+        # Devolver mini-imagen con el error (evita 5xx en healthcheck)
         err = str(e)
         blank = np.zeros((240, 640, 3), np.uint8)
-        cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        cv2.putText(blank, f"ERR: {err[:60]}", (10,120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
         ok, png = cv2.imencode(".png", blank)
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
@@ -357,7 +420,8 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
     if TEXT_ONLY:
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
         note = "Modo TEXT_ONLY activo: mapa desactivado."
-        dbg = {"TEXT_ONLY": True, "owners_by_parcel_sample": dict(list(parcel2owner.items())[:6])} if debug else None
+        dbg = {"TEXT_ONLY": True,
+               "owners_by_parcel_sample": dict(list(parcel2owner.items())[:8])} if debug else None
         return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
 
@@ -367,18 +431,11 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         linderos, vdbg, _vis = detect_neighbors_and_assign(bgr, parcel2owner)
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
         note = None if any(linderos.values()) else "OCR sin coincidencias claras; afinaremos ROI y mapeo de titulares."
-
-        dbg = None
-        if debug:
-            try:
-                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                    p2 = pdf.pages[1].extract_text(x_tolerance=2, y_tolerance=2) or ""
-                dbg = {"owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]),
-                       **vdbg,
-                       "p2_text_sample": (normalize_text(p2).split("\n")[:28])}
-            except Exception:
-                dbg = {"owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]), **vdbg}
-
+        extra = {"p2_text_sample": sample_page2_text(pdf_bytes)}
+        dbg = {
+            "owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]),
+            **vdbg, **(extra if debug else {})
+        } if debug else None
         return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
     except Exception as e:
         owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
@@ -386,5 +443,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         dbg = {"exception": str(e)} if debug else None
         return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
+
 
 
