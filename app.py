@@ -1,27 +1,25 @@
 from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query
 from pydantic import BaseModel, AnyHttpUrl
-from starlette.responses import StreamingResponse
+from starlette.responses import StreamingResponse, JSONResponse
 from typing import Dict, List, Optional, Tuple
-from collections import Counter
 import requests, io, re, os, math
 import numpy as np
 import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
-import pytesseract
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.3.10")
+app = FastAPI(title="AutoCatastro AI", version="0.4.0")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
 # ──────────────────────────────────────────────────────────────────────────────
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
-TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
+TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")  # aquí no se usa, pero lo mantenemos
 
 def check_token(x_autocata_token: str = Header(default="")):
     if AUTH_TOKEN and x_autocata_token != AUTH_TOKEN:
@@ -42,16 +40,15 @@ class ExtractOut(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades PDF / Texto
 # ──────────────────────────────────────────────────────────────────────────────
-MAX_NAME_LEN   = 26
-UPPER_NAME_RE  = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
-DNI_RE         = re.compile(r"\b\d{8}[A-Z]\b")
-PARCEL_ONLY_RE = re.compile(r"PARCELA\s+(\d{1,5})", re.IGNORECASE)
+UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
 
 STOP_IN_NAME = (
-    "POLÍGONO", "POLIGONO", "PARCELA", "[", "]", "(", ")",
-    "COORDENADAS", "ETRS", "HUSO", "ESCALA", "TITULARIDAD",
-    "VALOR CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION",
-    "REFERENCIA CATASTRAL", "DOMICILIO", "NIF"
+    "POLÍGONO", "POLIGONO", "PARCELA",
+    "COORDENADAS", "ETRS", "HUSO", "ESCALA",
+    "TITULARIDAD", "VALOR CATASTRAL",
+    "LOCALIZACIÓN", "LOCALIZACION",
+    "REFERENCIA CATASTRAL", "APELLIDOS NOMBRE", "RAZON SOCIAL",
+    "NIF", "DOMICILIO"
 )
 
 def fetch_pdf_bytes(url: str) -> bytes:
@@ -74,208 +71,116 @@ def normalize_text(s: str) -> str:
 
 def is_upper_name(line: str) -> bool:
     line = line.strip()
-    if not line:
-        return False
+    if not line: return False
     U = line.upper()
-    if len(U) > MAX_NAME_LEN:
-        return False
-    for bad in STOP_IN_NAME:
-        if bad in U:
-            return False
-    if sum(ch.isdigit() for ch in line) >= 3:
-        return False
-    return bool(UPPER_NAME_RE.match(line))
+    if any(bad in U for bad in STOP_IN_NAME): return False
+    if any(ch.isdigit() for ch in U): return False
+    return bool(UPPER_NAME_RE.match(U)) and len(line) <= 26  # regla de 26 chars
 
-def reconstruct_owner(lines: List[str]) -> str:
-    """Une 1–3 líneas en mayúsculas en un nombre razonable."""
-    toks: List[str] = []
-    for ln in lines:
-        ln = re.sub(r"\s+", " ", ln.strip())
-        if ln:
-            toks.extend(ln.split(" "))
-    clean = []
-    i = 0
-    while i < len(toks):
-        tok = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\-\.'']", "", toks[i])
-        if not tok:
-            i += 1
-            continue
-        # pegados típicos (A L VARELA → ALVARELA)
-        if len(tok) <= 2 and i + 1 < len(toks):
-            nxt = re.sub(r"[^A-ZÁÉÍÓÚÜÑ]", "", toks[i+1])
-            if nxt and len(nxt) >= 3:
-                clean.append(tok + nxt)
-                i += 2
-                continue
-        clean.append(tok)
-        i += 1
-    name = " ".join(clean)
-    name = re.sub(r"\s{2,}", " ", name).strip()
+def reconstruct_owner_candidates(lines: List[str]) -> str:
+    """
+    Toma hasta 2 líneas tipo nombre en MAYÚSCULAS (≤26 c/u) y las une si cabe.
+    Evita números y rótulos.
+    """
+    cands = [ln.strip() for ln in lines if is_upper_name(ln)]
+    if not cands:
+        return ""
+    name = cands[0]
+    if len(cands) >= 2 and len(name) + 1 + len(cands[1]) <= 26:
+        name = f"{name} {cands[1]}"
     return name
 
-def strip_at_first_digits(s: str) -> str:
-    """Corta la línea justo antes del DNI u otro bloque de números (NIF/domicilio)."""
-    m_dni = DNI_RE.search(s)
-    cut = m_dni.start() if m_dni else None
-    if cut is None:
-        m_nums = re.search(r"\d{3,}", s)
-        if m_nums:
-            cut = m_nums.start()
-    if cut is not None:
-        return s[:cut].rstrip()
-    return s
-
-def _collect_upper_block(lines: List[str], start: int, max_steps: int = 16) -> List[str]:
+def owners_by_rows_from_page2(pdf_bytes: bytes) -> List[str]:
     """
-    Recoge hasta 3 líneas con MAYÚSCULAS (<=26 chars). Si la línea mezcla NIF/domicilio,
-    se corta por el primer bloque numérico antes de evaluar.
-    Acepta también segundas líneas cortas tipo 'LUIS'.
+    Devuelve lista de titulares por orden de aparición en la página 2.
+    Estrategia: localizar bloques tras 'Titularidad principal' / cabecera de tabla
+    y recoger 1–2 líneas en MAYÚSCULAS (≤26), ignorando NIF/Domicilio/números.
     """
-    picked: List[str] = []
-    steps = 0
-    j = start
-    while j < len(lines) and steps < max_steps and len(picked) < 3:
-        raw = lines[j].strip()
-        U = raw.upper()
-        if not raw:
-            j += 1; steps += 1; continue
-        if ("REFERENCIA CATASTRAL" in U) or ("RELACIÓN DE PARCELAS" in U) or ("RELACION DE PARCELAS" in U):
-            break
-        if ("APELLIDOS NOMBRE" in U) or ("RAZON SOCIAL" in U) or ("NIF" in U) or ("DOMICILIO" in U):
-            j += 1; steps += 1; continue
-
-        cand = strip_at_first_digits(raw)
-        if is_upper_name(cand):
-            picked.append(cand)
-        elif picked and re.fullmatch(r"[A-ZÁÉÍÓÚÜÑ]{2,12}", U) and len(U) <= MAX_NAME_LEN:
-            picked.append(U)
-
-        j += 1; steps += 1
-    return picked
-
-def _owner_from_window(lines: List[str], start: int) -> str:
-    """
-    Fallback general: aunque no aparezca 'Titularidad principal', busca el nombre
-    en las ~12 líneas siguientes a la 'Localización: Polígono … Parcela N'.
-    """
-    picked = _collect_upper_block(lines, start, max_steps=12)
-    return reconstruct_owner(picked) if picked else ""
-
-def extract_owners_map(pdf_bytes: bytes) -> Dict[str, str]:
-    """
-    Construye dict {parcela: titular} desde páginas ≥2.
-    • Detecta '... Parcela N' en línea de localización.
-    • Intenta después de 'Titularidad principal' y, si no aparece en el texto extraído,
-      usa un Fallback genérico que mira una ventana de ~12 líneas y corta por números.
-    """
-    mapping: Dict[str, str] = {}
+    owners: List[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for pi, page in enumerate(pdf.pages):
-            if pi == 0:
-                continue  # saltar portada
-            text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-            lines = normalize_text(text).split("\n")
+        if len(pdf.pages) < 2:
+            return owners
+        page = pdf.pages[1]  # página 2 (0-index)
+        text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+        lines = normalize_text(text).split("\n")
 
-            curr_parcel: Optional[str] = None
-            i = 0
-            while i < len(lines):
-                raw = lines[i].strip()
-                up  = raw.upper()
+        i = 0
+        while i < len(lines):
+            U = lines[i].strip().upper()
+            # detectar cabecera que precede al nombre
+            if ("TITULARIDAD PRINCIPAL" in U) or ("APELLIDOS NOMBRE" in U and "RAZON" in U):
+                j = i + 1
+                window: List[str] = []
+                steps = 0
+                # escanear como mucho 10 líneas tras la cabecera
+                while j < len(lines) and steps < 10:
+                    raw = lines[j].strip()
+                    UU  = raw.upper()
+                    if not raw: 
+                        j += 1; steps += 1; continue
+                    # cortar si vemos rótulos claros de otra sección
+                    if any(tag in UU for tag in ("REFERENCIA CATASTRAL", "RELACIÓN DE PARCELAS", "RELACION DE PARCELAS")):
+                        break
+                    # ignorar explicitamente columnas de tabla
+                    if any(tag in UU for tag in ("APELLIDOS NOMBRE", "RAZON SOCIAL", "NIF", "DOMICILIO")):
+                        j += 1; steps += 1; continue
+                    # recoger candidatos de nombre (MAYÚSCULAS ≤26)
+                    if is_upper_name(raw):
+                        window.append(raw)
+                        # si ya tenemos 2 líneas, paramos
+                        if len(window) >= 2:
+                            break
+                    j += 1; steps += 1
 
-                # (1) Detectar "PARCELA N"
-                if "PARCELA" in up:
-                    tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
-                    if tokens:
-                        curr_parcel = tokens[-1]
-                        # Intento 1: si justo después hay cabecera, úsala
-                        owner = ""
-                        # Buscamos una cabecera cercana
-                        # Nota: en muchos PDFs esta frase no sale en el texto extraído.
-                        k = i + 1
-                        found_header = False
-                        while k < len(lines) and k < i + 6:
-                            U2 = lines[k].upper()
-                            if ("TITULARIDAD" in U2 and "PRINCIPAL" in U2) or ("APELLIDOS NOMBRE" in U2 and "RAZON" in U2):
-                                found_header = True
-                                break
-                            k += 1
-                        if found_header:
-                            block = _collect_upper_block(lines, k + 1, max_steps=16)
-                            owner = reconstruct_owner(block) if block else ""
-                        else:
-                            # Fallback 2: ventana corta tras la línea de 'PARCELA'
-                            owner = _owner_from_window(lines, i + 1)
+                owner = reconstruct_owner_candidates(window)
+                if owner:
+                    owners.append(owner)
+                i = j
+                continue
+            i += 1
 
-                        if curr_parcel and owner and curr_parcel not in mapping:
-                            mapping[curr_parcel] = owner
-
-                i += 1
-    return mapping
-
-def sample_page2_text(pdf_bytes: bytes, max_lines: int = 26) -> List[str]:
-    out: List[str] = []
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            if len(pdf.pages) >= 2:
-                txt = pdf.pages[1].extract_text(x_tolerance=3, y_tolerance=3) or ""
-                out = normalize_text(txt).split("\n")[:max_lines]
-    except Exception:
-        pass
-    return out
-
-# ──────────────────────────────────────────────────────────────────────────────
-# OpenCV helpers (fallbacks seguros)
-# ──────────────────────────────────────────────────────────────────────────────
-def cv_flag(name: str, default: int = 0) -> int:
-    return int(getattr(cv2, name, default))
-
-THRESH_BINARY     = cv_flag("THRESH_BINARY", 0)
-THRESH_BINARY_INV = cv_flag("THRESH_BINARY_INV", 0)
-THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
+    return owners
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Visión por computador (página 2)
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
-    dpi = 400 if FAST_MODE else 550
+    dpi = 360 if FAST_MODE else 520
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
     pil: Image.Image = pages[0].convert("RGB")
     return np.array(pil)[:, :, ::-1]  # RGB→BGR
 
-def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
-    h, w = bgr.shape[:2]
-    top = int(h * 0.12); bottom = int(h * 0.92)
-    left = int(w * 0.08); right = int(w * 0.92)
-    top = max(0, top); bottom = min(h, bottom)
-    left = max(0, left); right = min(w, right)
-    if bottom - top < 100 or right - left < 100:
-        return bgr, (0, 0)
-    return bgr[top:bottom, left:right], (left, top)
-
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Devuelve (mask_verde_principal, mask_rosa_vecinos).
+    Rangos amplios para aguantar distintas impresiones/escaneos.
+    """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Verde agua (parcela propia)
     g_ranges = [
         (np.array([35,  20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
         (np.array([86,  15, 50], np.uint8), np.array([100,255,255], np.uint8)),
     ]
-    # Rosa (vecinos)
     p_ranges = [
-        (np.array([160, 20, 80], np.uint8), np.array([179,255,255], np.uint8)),
-        (np.array([  0, 20, 80], np.uint8), np.array([ 10,255,255], np.uint8)),
+        (np.array([160, 20, 70], np.uint8), np.array([179,255,255], np.uint8)),
+        (np.array([  0, 20, 70], np.uint8), np.array([ 10,255,255], np.uint8)),
     ]
     mg = np.zeros(hsv.shape[:2], np.uint8)
     for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     mp = np.zeros(hsv.shape[:2], np.uint8)
     for lo, hi in p_ranges: mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
-    k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
+
+    k3 = np.ones((3,3), np.uint8)
+    k5 = np.ones((5,5), np.uint8)
     mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3); mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
     mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
     return mg, mp
 
-def contours_centroids(mask: np.ndarray, min_area: int = 250) -> List[Tuple[int,int,int]]:
+def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int,Tuple[int,int,int,int]]]:
+    """
+    Devuelve lista de (cx,cy,area, bbox) de contornos suficientemente grandes.
+    """
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in cnts:
@@ -284,135 +189,164 @@ def contours_centroids(mask: np.ndarray, min_area: int = 250) -> List[Tuple[int,
         M = cv2.moments(c)
         if M["m00"] == 0: continue
         cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
-        out.append((cx, cy, int(a)))
-    out.sort(key=lambda x: -x[2])
+        x,y,w,h = cv2.boundingRect(c)
+        out.append((cx, cy, int(a), (x,y,w,h)))
+    out.sort(key=lambda x: x[1])  # por Y ascendente
     return out
+
+def cluster_rows_by_y(points: List[Tuple[int,int]], thr: int) -> List[List[int]]:
+    """
+    Agrupa índices de puntos por proximidad vertical (simple binning).
+    """
+    if not points: return []
+    # points: [(cx,cy), ...] ya en orden por Y
+    rows: List[List[int]] = [[0]]
+    for idx in range(1, len(points)):
+        _, prev_y = points[idx-1]
+        _, this_y = points[idx]
+        if abs(this_y - prev_y) > thr:
+            rows.append([idx])
+        else:
+            rows[-1].append(idx)
+    return rows
 
 def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
-    ang = math.degrees(math.atan2(-(sy), sx))  # Norte arriba
+    # Norte arriba, Sur abajo, Este derecha, Oeste izquierda
+    ang = math.degrees(math.atan2(-(sy), sx))
     if -45 <= ang <= 45: return "este"
     if 45 < ang <= 135:  return "norte"
     if -135 <= ang < -45:return "sur"
     return "oeste"
 
-def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
-    cfg = f"--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789"
-    data = pytesseract.image_to_string(img, config=cfg) or ""
-    return re.sub(r"\D+", "", data)
+def annotate_preview(img: np.ndarray, rows_info: List[dict], draw_names: bool):
+    for r in rows_info:
+        main = r.get("main_center")
+        neigh = r.get("neigh_center")
+        side = r.get("side","")
+        owner = r.get("owner","")
+        if main:
+            cv2.circle(img, tuple(main), 9, (0,255,0), -1)
+        if neigh:
+            cv2.circle(img, tuple(neigh), 9, (0,0,255), -1)
+        if neigh and side:
+            label = {"norte":"N","sur":"S","este":"E","oeste":"O"}.get(side, "?")
+            cv2.putText(img, label, (neigh[0]+8, neigh[1]-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
+            if draw_names and owner:
+                cv2.putText(img, owner, (neigh[0]+20, neigh[1]+16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
-def _ocr_digit_variants(gray: np.ndarray) -> List[str]:
-    out = []
-    has_otsu = hasattr(cv2, "THRESH_OTSU")
-    flags_bin = cv2.THRESH_BINARY | (cv2.THRESH_OTSU if has_otsu else 0)
-    flags_inv = cv2.THRESH_BINARY_INV | (cv2.THRESH_OTSU if has_otsu else 0)
-    thr = 0 if has_otsu else 127
-    for tflag in (flags_bin, flags_inv):
-        _, bw = cv2.threshold(gray, thr, 255, tflag)
-        for psm in (7, 6):
-            txt = ocr_digits(bw, psm=psm)
-            if txt:
-                out.append(txt)
-    return out
-
-def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], base_box: int = 110) -> str:
-    """Lee dígitos cerca de 'center' con votación (varios tamaños y ligeros desplazamientos)."""
-    h, w = bgr.shape[:2]
-    xs = [0, +8, -8]; ys = [0, -8, +8]
-    sizes = [max(70, base_box-30), base_box]
-    votes: Counter = Counter()
-    for dx in xs:
-        for dy in ys:
-            for box in sizes:
-                x, y = center[0] + dx, center[1] + dy
-                half = box // 2
-                x0, y0 = max(0, x - half), max(0, y - half)
-                x1, y1 = min(w, x + half), min(h, y + half)
-                crop = bgr[y0:y1, x0:x1]
-                if crop.size == 0:
-                    continue
-                g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-                for num in _ocr_digit_variants(g):
-                    votes[num] += 1
-    if not votes:
-        return ""
-    best_num, _ = votes.most_common(1)[0]
-    return best_num
-
-def detect_neighbors_and_assign(bgr: np.ndarray,
-                                parcel2owner: Dict[str,str],
-                                do_ocr: bool = True) -> Tuple[Dict[str,str], dict, np.ndarray]:
-    """Devuelve (linderos, debug, annotated_png_bgr)."""
+def detect_rows_and_sides(bgr: np.ndarray) -> Tuple[List[dict], np.ndarray]:
+    """
+    Detecta filas a partir de manchas ROSA; por cada fila, busca la mayor mancha VERDE
+    cercana, calcula lado con el vector verde→rosa y devuelve estructura por-fila.
+    """
     vis = bgr.copy()
-    crop, (ox, oy) = crop_map(bgr)
-    mg, mp = color_masks(crop)
+    H, W = bgr.shape[:2]
 
-    # Centro principal
-    mains = contours_centroids(mg, min_area=(400 if FAST_MODE else 250))
-    if not mains:
-        return {"norte":"","sur":"","este":"","oeste":""}, {"reason":"no_main_green"}, vis
-    main_cx, main_cy, _ = mains[0]
-    main_abs = (main_cx + ox, main_cy + oy)
-    cv2.circle(vis, main_abs, 10, (0,255,0), -1)
+    mg, mp = color_masks(bgr)
 
-    # Vecinos
-    neighs = contours_centroids(mp, min_area=(280 if FAST_MODE else 180))
+    # Contornos
+    g_list = contours_centroids(mg, min_area=(250 if FAST_MODE else 180))
+    p_list = contours_centroids(mp, min_area=(220 if FAST_MODE else 160))
 
-    if not do_ocr:
-        for (cx, cy, _a) in neighs[: (24 if FAST_MODE else 48)]:
-            abs_pt = (cx + ox, cy + oy)
-            cv2.circle(vis, abs_pt, 8, (0,0,255), -1)
-            sd = side_of(main_abs, abs_pt)
-            cv2.putText(vis, sd[:1].upper(), (abs_pt[0]+6, abs_pt[1]-6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
-        return {"norte":"","sur":"","este":"","oeste":""}, {
-            "main_center": main_abs,
-            "neighbors": len(neighs),
-            "side2parcel": {}
-        }, vis
+    # Si no hay vecinos rosa, no hay filas
+    if not p_list:
+        return [], vis
 
-    candidates_by_side: Dict[str, List[Tuple[str, Tuple[int,int], float]]] = {}
-    max_neigh = 24 if FAST_MODE else 48
-    for (cx, cy, _a) in neighs[:max_neigh]:
-        abs_pt = (cx + ox, cy + oy)
-        cv2.circle(vis, abs_pt, 8, (0,0,255), -1)
-        sd = side_of(main_abs, abs_pt)
+    # Agrupar ROSA por filas (proximidad vertical)
+    p_points = [(cx,cy) for (cx,cy,_a,_bb) in p_list]
+    row_thr = max(18, int(H * 0.06))
+    p_rows_idx = cluster_rows_by_y(p_points, thr=row_thr)
 
-        raw_num = read_parcel_number_at(bgr, abs_pt, base_box=(90 if FAST_MODE else 120))
-        if not raw_num:
-            continue
-        if raw_num not in parcel2owner:
-            stripped = raw_num.lstrip("0")
-            if not (stripped and stripped in parcel2owner):
+    rows_info: List[dict] = []
+    for ridx, idxs in enumerate(p_rows_idx):
+        # centroid medio rosa de la fila (o el mayor área de la fila)
+        idxs_sorted = sorted(idxs, key=lambda i: -p_list[i][2])
+        i_top = idxs_sorted[0]
+        neigh_cx, neigh_cy, _a, bb = p_list[i_top]
+        neigh_center = [int(neigh_cx), int(neigh_cy)]
+
+        # buscar VERDE más cercano por distancia euclídea en esta banda vertical
+        best_g = None
+        best_d = 10**9
+        for (gcx,gcy,ga,_gbb) in g_list:
+            dy = abs(gcy - neigh_cy)
+            if dy > row_thr:  # fuera de banda vertical de la fila
                 continue
-            raw_num = stripped
+            d = (gcx - neigh_cx)**2 + (gcy - neigh_cy)**2
+            if d < best_d:
+                best_d = d
+                best_g = (gcx, gcy, ga)
 
-        d2 = float((abs_pt[0]-main_abs[0])**2 + (abs_pt[1]-main_abs[1])**2)
-        candidates_by_side.setdefault(sd, []).append((raw_num, abs_pt, d2))
+        main_center = None
+        side = ""
+        if best_g:
+            mcx, mcy, _ = best_g
+            main_center = [int(mcx), int(mcy)]
+            side = side_of((mcx, mcy), (neigh_cx, neigh_cy))
 
-    side2parcel: Dict[str, str] = {}
-    for sd, items in candidates_by_side.items():
-        best = min(items, key=lambda t: t[2])
-        num, pt, _ = best
-        side2parcel[sd] = num
-        cv2.putText(vis, f"{sd[:1].upper()}:{num}", (pt[0]+6, pt[1]-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
+        rows_info.append({
+            "row_index": ridx,
+            "main_center": main_center,
+            "neigh_center": neigh_center,
+            "side": side,
+            "bbox_hint": bb
+        })
 
+    return rows_info, vis
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lógica completa de extracción (v0.4.0)
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_v040(pdf_bytes: bytes, want_preview: bool=False, draw_labels: bool=False):
+    """
+    1) Texto (pág. 2) → lista de titulares por filas.
+    2) Visión (pág. 2) → filas visuales con lado (N/S/E/O).
+    3) Emparejar por orden (fila 0 con fila 0, etc.).
+    """
+    # (1) titulares por filas
+    owners_rows = owners_by_rows_from_page2(pdf_bytes)  # e.g. ["VAZQUEZ POMBO DOSINDA", "MOSQUERA ...", ...]
+    # (2) filas visuales con lado
+    bgr = page2_bgr(pdf_bytes)
+    rows_info, vis = detect_rows_and_sides(bgr)
+
+    # emparejar por orden top→bottom
+    for i, r in enumerate(rows_info):
+        r["owner"] = owners_rows[i] if i < len(owners_rows) else ""
+
+    # construir linderos
     linderos = {"norte":"","sur":"","este":"","oeste":""}
-    for sd, num in side2parcel.items():
-        owner = parcel2owner.get(num, "")
-        if owner:
-            linderos[sd] = owner
+    for r in rows_info:
+        sd = r.get("side","")
+        nm = r.get("owner","")
+        if sd and nm and not linderos[sd]:
+            linderos[sd] = nm
 
-    dbg = {
-        "main_center": main_abs,
-        "neighbors": len(neighs),
-        "side2parcel": side2parcel,
+    # owners_detected (deduplicado, top-8)
+    owners_detected = []
+    for r in rows_info:
+        nm = r.get("owner","")
+        if nm and nm not in owners_detected:
+            owners_detected.append(nm)
+        if len(owners_detected) >= 8: break
+
+    debug = {
+        "rows": rows_info,
+        "owners_rows": owners_rows[:8]
     }
-    return linderos, dbg, vis
+
+    if want_preview:
+        annotate_preview(vis, rows_info, draw_labels)
+        ok, png = cv2.imencode(".png", vis)
+        if not ok:
+            raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
+        return png.tobytes()
+
+    return linderos, owners_detected, debug, vis
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
@@ -420,36 +354,24 @@ def detect_neighbors_and_assign(bgr: np.ndarray,
 @app.get("/health")
 def health():
     return {
-        "ok": True,
-        "version": app.version,
-        "FAST_MODE": FAST_MODE,
-        "TEXT_ONLY": TEXT_ONLY,
-        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
+        "ok": True, "version": app.version,
+        "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
 def preview_get(pdf_url: AnyHttpUrl = Query(...), labels: int = Query(0)):
-    """
-    Preview rápido por defecto (labels=0): sin OCR → puntos y letras N/S/E/O.
-    labels=1: con OCR de números (más lento) y anotación de parcela por lado.
-    """
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     try:
-        parcel2owner = extract_owners_map(pdf_bytes)
-        bgr = page2_bgr(pdf_bytes)
-        linderos, dbg, vis = detect_neighbors_and_assign(bgr, parcel2owner, do_ocr=bool(labels))
+        png_bytes = extract_v040(pdf_bytes, want_preview=True, draw_labels=(labels == 1))
+        return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
     except Exception as e:
+        # mini-imagen con el error para no romper healthchecks
         err = str(e)
-        blank = np.zeros((240, 640, 3), np.uint8)
-        cv2.putText(blank, f"ERR: {err[:60]}", (10,120),
+        blank = np.zeros((240, 800, 3), np.uint8)
+        cv2.putText(blank, f"ERR: {err[:70]}", (10,120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
         ok, png = cv2.imencode(".png", blank)
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
-
-    ok, png = cv2.imencode(".png", vis)
-    if not ok:
-        raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
-    return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
 @app.post("/preview", dependencies=[Depends(check_token)])
 def preview_post(data: ExtractIn = Body(...), labels: int = Query(0)):
@@ -458,35 +380,19 @@ def preview_post(data: ExtractIn = Body(...), labels: int = Query(0)):
 @app.post("/extract", response_model=ExtractOut, dependencies=[Depends(check_token)])
 def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
-
-    # 1) Texto (páginas ≥2): parcela → titular
-    parcel2owner = extract_owners_map(pdf_bytes)
-
-    if TEXT_ONLY:
-        owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
-        note = "Modo TEXT_ONLY activo: mapa desactivado."
-        dbg = {"TEXT_ONLY": True,
-               "owners_by_parcel_sample": dict(list(parcel2owner.items())[:8])} if debug else None
-        return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
-                          owners_detected=owners_detected, note=note, debug=dbg)
-
-    # 2) Visión (pág. 2)
     try:
-        bgr = page2_bgr(pdf_bytes)
-        linderos, vdbg, _vis = detect_neighbors_and_assign(bgr, parcel2owner, do_ocr=True)
-        owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
-        note = None if any(linderos.values()) else "OCR sin coincidencias claras; afinaremos ROI y mapeo de titulares."
-        extra = {"p2_text_sample": sample_page2_text(pdf_bytes)}
-        dbg = {
-            "owners_by_parcel_sample": dict(list(parcel2owner.items())[:8]),
-            **vdbg, **(extra if debug else {})
-        } if debug else None
-        return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
+        linderos, owners_detected, dbg, _vis = extract_v040(pdf_bytes, want_preview=False)
+        return ExtractOut(
+            linderos=linderos,
+            owners_detected=owners_detected,
+            note=None if any(linderos.values()) else "No se pudo determinar lado/vecino con suficiente confianza.",
+            debug=dbg if debug else None
+        )
     except Exception as e:
-        owners_detected = list(dict.fromkeys(parcel2owner.values()))[:8]
-        note = f"Excepción visión/OCR: {e}"
-        dbg = {"exception": str(e)} if debug else None
-        return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
-                          owners_detected=owners_detected, note=note, debug=dbg)
-
+        return ExtractOut(
+            linderos={"norte":"","sur":"","este":"","oeste":""},
+            owners_detected=[],
+            note=f"Excepción v0.4.0: {e}",
+            debug={"exception": str(e)} if debug else None
+        )
 
