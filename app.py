@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query
 from pydantic import BaseModel, AnyHttpUrl
-from starlette.responses import StreamingResponse, JSONResponse
+from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
 import requests, io, re, os, math
 import numpy as np
@@ -12,7 +12,7 @@ import cv2
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.2")
+app = FastAPI(title="AutoCatastro AI", version="0.4.3")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -38,7 +38,7 @@ class ExtractOut(BaseModel):
     debug: Optional[dict] = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades PDF / Texto (para owners por COLUMNA)
+# Utilidades PDF / Texto (titulares POR COLUMNA en pág. 2)
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -56,9 +56,8 @@ UPPER_TOKEN = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\.\-\' ]+$")
 
 def owners_by_column_page2(pdf_bytes: bytes) -> List[dict]:
     """
-    Extrae titulares leyendo SOLO la columna 'Apellidos Nombre / Razón social'
-    bajo su cabecera (misma línea donde aparece 'NIF').
-    Devuelve: [{"y": y_cabecera, "x0": x_ini_col, "x1": x_ini_nif, "name": "TITULAR"}...]
+    Lee SOLO la columna 'Apellidos Nombre / Razón social' bajo su cabecera.
+    Devuelve [{y, x0, x1, name}] por fila detectada (y ~ línea de cabecera).
     """
     owners: List[dict] = []
     try:
@@ -70,7 +69,6 @@ def owners_by_column_page2(pdf_bytes: bytes) -> List[dict]:
     except Exception:
         return owners
 
-    # Agrupar palabras por fila aproximada (y redondeado)
     from collections import defaultdict
     rows = defaultdict(list)
     for w in words:
@@ -90,29 +88,32 @@ def owners_by_column_page2(pdf_bytes: bytes) -> List[dict]:
     if not headers:
         return owners
 
-    # Para cada cabecera, lee las palabras inmediatamente debajo dentro de la banda de esa "tarjeta"
+    # Para cada cabecera, leer palabras en la banda vertical de esa "tarjeta"
     for i, (y_hdr, x0_name, x0_nif) in enumerate(headers):
         y_lo = y_hdr + 2
-        y_hi = headers[i+1][0] - 2 if i + 1 < len(headers) else y_hdr + 120  # ventana vertical bajo cabecera
+        # a falta de otra cabecera: ventana conservadora
+        y_hi = headers[i+1][0] - 2 if i + 1 < len(headers) else y_hdr + (140 if FAST_MODE else 170)
+
         col_words = [w for w in words
                      if y_lo <= w["top"] <= y_hi and (x0_name - 2) <= w["x0"] <= (x0_nif - 2)]
-        # Orden lectura: arriba→abajo, izquierda→derecha
         col_words.sort(key=lambda w: (w["top"], w["x0"]))
-        # Filtra ruidos (NIF, números, domicilio); junta solo tokens "tipo nombre" en MAYÚSCULAS
+
         toks = []
         for w in col_words:
             t = (w["text"] or "").strip()
-            if not t or any(ch.isdigit() for ch in t):
+            if not t or any(ch.isdigit() for ch in t):  # corta números/NIF dentro de la columna
                 continue
             if UPPER_TOKEN.match(t):
                 toks.append(t)
+
         txt = " ".join(toks)
-        # Corta si hay NIF oculto o números largos en el string
+        # corta en posibles patrones numéricos largos o NIF
         txt = re.split(r"\b\d{5,}|\b\d{8}[A-Z]\b", txt)[0].strip()
-        # Límite 26 caracteres (ajuste a último espacio para no cortar palabras)
+        # Límite 26 chars respetando palabra
         if len(txt) > 26:
             cut = txt[:26]
             txt = cut[:cut.rfind(" ")] if " " in cut else cut
+
         if txt:
             owners.append({"y": y_hdr, "x0": x0_name, "x1": x0_nif, "name": txt})
     return owners
@@ -124,10 +125,10 @@ def pick_owner_for_y(owners_rows: List[dict], y: int) -> str:
     return (best.get("name") or "").strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Visión por computador (página 2) para lados N/S/E/O
+# Visión en pág. 2 (N/S/E/O por verde→rosa)
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
-    dpi = 400 if FAST_MODE else 550
+    dpi = 360 if FAST_MODE else 520
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
@@ -135,7 +136,7 @@ def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
     return np.array(pil)[:, :, ::-1]  # RGB→BGR
 
 def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
-    """Recorta margen global para aislar la zona de listados con mini-mapas."""
+    """Recorte general para la zona de listados con mini-mapas."""
     h, w = bgr.shape[:2]
     top = int(h * 0.12); bottom = int(h * 0.96)
     left = int(w * 0.06); right = int(w * 0.92)
@@ -146,7 +147,6 @@ def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
     return bgr[top:bottom, left:right], (left, top)
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Devuelve (mask_verde_principal, mask_rosa_vecinos)."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     # Verde agua (parcela propia)
     g_ranges = [
@@ -177,25 +177,20 @@ def contours_centroids(mask: np.ndarray, min_area: int = 220) -> List[Tuple[int,
         if M["m00"] == 0: continue
         cx = int(M["m10"] / M["m00"]) ; cy = int(M["m01"] / M["m00"]) ;
         out.append((cx, cy, int(a)))
-    out.sort(key=lambda x: x[1])  # ordenar por Y ascendente (de arriba a abajo)
+    out.sort(key=lambda x: x[1])  # Y ascendente (fila arriba→abajo)
     return out
 
 def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
-    # Norte arriba, Sur abajo, Este derecha, Oeste izquierda
-    ang = math.degrees(math.atan2(-(sy), sx))
+    ang = math.degrees(math.atan2(-(sy), sx))  # Norte arriba
     if -45 <= ang <= 45: return "este"
     if 45 < ang <= 135:  return "norte"
     if -135 <= ang < -45:return "sur"
     return "oeste"
 
 def detect_rows_and_sides(bgr: np.ndarray) -> List[dict]:
-    """
-    Detecta para cada 'fila' (mini-mapa) el centro verde (main) y el vecino rosa
-    más cercano. Devuelve lista de dicts con side estimado.
-    """
     crop, (ox, oy) = crop_map(bgr)
     mg, mp = color_masks(crop)
 
@@ -206,7 +201,6 @@ def detect_rows_and_sides(bgr: np.ndarray) -> List[dict]:
     if not greens:
         return rows
 
-    # Para cada verde, emparejar rosa más cercano (si existe)
     for gi, (gx, gy, _ga) in enumerate(greens):
         g_abs = (gx + ox, gy + oy)
         # rosa más cercano
@@ -228,11 +222,10 @@ def detect_rows_and_sides(bgr: np.ndarray) -> List[dict]:
     return rows
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Vista previa con etiquetas
+# Vista previa con etiquetas (N/S/E/O y opcionalmente nombres)
 # ──────────────────────────────────────────────────────────────────────────────
 def draw_preview(bgr: np.ndarray, rows: List[dict], owners_rows: Optional[List[dict]], labels: bool, names: bool) -> np.ndarray:
     vis = bgr.copy()
-    # puntos y líneas
     for r in rows:
         mc = r.get("main_center")
         nc = r.get("neigh_center")
@@ -244,7 +237,7 @@ def draw_preview(bgr: np.ndarray, rows: List[dict], owners_rows: Optional[List[d
             cv2.line(vis, mc, nc, (255,255,255), 2)
             if labels:
                 label = {"norte":"N","sur":"S","este":"E","oeste":"O"}.get(sd, "?")
-                cv2.putText(vis, label, (nc[0]+10, nc[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+                cv2.putText(vis, label, (nc[0]+10, nc[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
                 if names and owners_rows:
                     yref = int((mc[1] + nc[1]) / 2) if mc and nc else (nc[1] if nc else mc[1])
                     name = pick_owner_for_y(owners_rows, yref)
@@ -262,21 +255,20 @@ def health():
 @app.get("/preview", dependencies=[Depends(check_token)])
 def preview_get(
     pdf_url: AnyHttpUrl = Query(...),
-    labels: bool = Query(False),
-    names: bool = Query(False),
+    labels: bool = Query(True),   # ← por defecto PINTA N/S/E/O
+    names: bool = Query(False),   # ← añade nombres si se pide
 ):
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     try:
         bgr = page2_bgr(pdf_bytes)
         rows = detect_rows_and_sides(bgr)
-        owners_rows = owners_by_column_page2(pdf_bytes) if (labels and names) else None
+        owners_rows = owners_by_column_page2(pdf_bytes) if names else None
         vis = draw_preview(bgr, rows, owners_rows, labels=labels, names=names)
         ok, png = cv2.imencode(".png", vis)
         if not ok:
             raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
     except Exception as e:
-        # Imagen pequeña con el error (evita 5xx en healthcheck)
         err = str(e)
         blank = np.zeros((240, 640, 3), np.uint8)
         cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
@@ -284,17 +276,16 @@ def preview_get(
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
 @app.post("/preview", dependencies=[Depends(check_token)])
-def preview_post(data: ExtractIn = Body(...), labels: bool = Query(False), names: bool = Query(False)):
+def preview_post(data: ExtractIn = Body(...), labels: bool = Query(True), names: bool = Query(False)):
     return preview_get(pdf_url=data.pdf_url, labels=labels, names=names)
 
 @app.post("/extract", response_model=ExtractOut, dependencies=[Depends(check_token)])
 def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
 
-    # 1) Extraer titulares por COLUMNA en la página 2
+    # (1) Titulares por columna en pág. 2
     owners_rows = owners_by_column_page2(pdf_bytes)
     owners_detected = [o["name"] for o in owners_rows if o.get("name")]
-    # quitar duplicados respetando orden
     owners_detected = list(dict.fromkeys(owners_detected))[:8]
 
     if TEXT_ONLY:
@@ -303,7 +294,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         return ExtractOut(linderos={"norte":"","sur":"","este":"","oeste":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
 
-    # 2) Visión en página 2 → lados por vector (verde→rosa)
+    # (2) Visión en pág. 2 → lados
     try:
         bgr = page2_bgr(pdf_bytes)
         rows = detect_rows_and_sides(bgr)
@@ -312,23 +303,20 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         for r in rows:
             mc = r.get("main_center"); nc = r.get("neigh_center")
             sd = r.get("side") or ""
-            if not sd: 
+            if not sd:
                 continue
             yref = None
             if mc and nc: yref = int((mc[1] + nc[1]) / 2)
             elif nc:      yref = nc[1]
             elif mc:      yref = mc[1]
-            if yref is None: 
+            if yref is None:
                 continue
             owner = pick_owner_for_y(owners_rows, yref)
             if owner and not linderos[sd]:
                 linderos[sd] = owner
 
-        note = None
-        if not any(linderos.values()):
-            note = "No se pudo determinar lado/vecino con suficiente confianza."
-
-        dbg = {"rows": rows, "owners_rows": owners_rows[:6]} if debug else None
+        note = None if any(linderos.values()) else "No se pudo determinar lado/vecino con suficiente confianza."
+        dbg  = {"rows": rows, "owners_rows": owners_rows[:6]} if debug else None
         return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
 
     except Exception as e:
@@ -336,5 +324,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         dbg = {"exception": str(e)} if debug else None
         return ExtractOut(linderos={"norte":"","sur":"","este":"","oeste":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
+
 
 
