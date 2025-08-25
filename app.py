@@ -264,47 +264,39 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
     """
     Devuelve (owner, (x0,y0,x1,y1), attempt_used)
 
-    Nueva lógica: extrae la LÍNEA 1 (titular) y la LÍNEA 2 inmediatamente inferior,
-    aplica los mismos criterios de limpieza a ambas y las pega. Evita NIF/domicilio
-    y limita el resultado a ~26 caracteres sin cortar palabras.
+    Corregido:
+    - ROI siempre en orden (x0<=x1, y0<=y1) y devuelto como (x0, y0, x1, y1)
+    - Usa línea 1 + línea 2 (debajo de la cabecera "Apellidos Nombre / Razón social")
+    - Filtros contra cabeceras/ruido (RAZON SOCIAL, NIF, DOMICILIO, etc.)
+    - Limita a ~26 caracteres sin partir palabras
     """
     h, w = bgr.shape[:2]
+
+    # Columna de texto (ajustada a la maquetación general de la página 2)
     x_text0 = int(w * 0.33)
     x_text1 = int(w * 0.96)
 
-    def is_meta_line(U: str) -> bool:
-        U = U.upper()
-        if any(ch.isdigit() for ch in U):
+    def is_meta_line(s: str) -> bool:
+        U = s.upper()
+        if "RAZON SOCIAL" in U or "APELLIDOS NOMBRE" in U:
             return True
-        META = ("NIF", "DOMICILIO", "CL ", "CALLE", "AV ", "AV.", "PORTAL", "ES:", "PL:", "PT:")
-        return any(m in U for m in META)
+        if "NIF" in U or "DOMICILIO" in U:
+            return True
+        # líneas con demasiados dígitos suelen ser direcciones
+        if sum(ch.isdigit() for ch in U) >= 3:
+            return True
+        return False
 
-    def ocr_owner_from_roi(roi: np.ndarray) -> str:
-        if roi.size == 0:
-            return ""
-        g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-        g = enhance_gray(g)
-        bw, bwi = binarize(g)
-        WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-        variants = (
-            ocr_text(bw,  psm=6,  whitelist=WL),
-            ocr_text(bwi, psm=6,  whitelist=WL),
-            ocr_text(bw,  psm=7,  whitelist=WL),
-            ocr_text(bwi, psm=7,  whitelist=WL),
-            ocr_text(bw,  psm=13, whitelist=WL),
-        )
-        for txt in variants:
-            cand = pick_owner_from_text(txt)
-            if cand:
-                return cand
-        return ""
+    def clean_person_name(s: str) -> str:
+        # solo letras, espacios y apóstrofes; colapsar espacios; MAYÚSCULAS
+        s = re.sub(r"[^A-ZÁÉÍÓÚÜÑ' ]+", " ", s.upper())
+        s = re.sub(r"\s{2,}", " ", s).strip()
+        return s
 
     def trim_to_26_chars(s: str) -> str:
         s = re.sub(r"\s{2,}", " ", s).strip()
         if len(s) <= 26:
             return s
-        # corta por palabras sin partir
         out, total = [], 0
         for tok in s.split():
             if total == 0:
@@ -317,56 +309,60 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
                 out.append(tok); total += 1 + len(tok)
         return " ".join(out)
 
+    def ocr_owner_from_roi(roi: np.ndarray, try_psms=(6,7,13)) -> str:
+        if roi.size == 0:
+            return ""
+        g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+        g = enhance_gray(g)
+        bw, bwi = binarize(g)
+        WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
+        for psm in try_psms:
+            for var in (bw, bwi):
+                txt = ocr_text(var, psm=psm, whitelist=WL)
+                if not txt:
+                    continue
+                txtc = clean_person_name(txt)
+                if txtc and not is_meta_line(txtc):
+                    return txtc
+        return ""
+
     attempts = []
     for attempt in range(3):
-        # Igual que antes: ampliar un poco a la izquierda en cada intento
+        # Expandimos un poco a la izquierda en cada intento por si la cabecera está desplazada
         extra_left = attempt * max(18, int(w * 0.03))
         x0_base = max(0, x_text0 - extra_left)
 
-        # Busca banda de cabecera + primera línea de titular
+        # Encuentra banda de cabecera + primera línea del titular
         x0, y0, x1, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
 
-        # ---- LÍNEA 1 (base) ----
+        # --- NORMALIZAR ORDEN ROI ---
+        x0, x1 = (x0, x1) if x0 <= x1 else (x1, x0)
+        y0, y1 = (y0, y1) if y0 <= y1 else (y1, y0)
+
+        # ROI línea 1 (titular principal)
         roi1 = bgr[y0:y1, x0:x1]
         owner1 = ocr_owner_from_roi(roi1)
 
-        # ---- LÍNEA 2 (inmediatamente bajo la línea 1) ----
+        # ROI línea 2 (inmediatamente debajo de la línea 1)
         line_h = max(12, y1 - y0)
-        gap    = max(3,  int(0.12 * line_h))  # pequeño margen
+        gap    = max(3,  int(0.12 * line_h))  # pequeño margen entre líneas
         y2a    = min(h, y1 + gap)
         y2b    = min(h, y2a + line_h)
         roi2   = bgr[y2a:y2b, x0:x1]
+        owner2 = ocr_owner_from_roi(roi2, try_psms=(7,6))
 
-        owner2 = ""
-        if roi2.size > 0:
-            g2 = cv2.cvtColor(roi2, cv2.COLOR_BGR2GRAY)
-            g2 = cv2.resize(g2, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-            g2 = enhance_gray(g2)
-            bw2, bwi2 = binarize(g2)
-            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-            cand2_raw = ""
-            for txt in (
-                ocr_text(bw2,  psm=7, whitelist=WL),
-                ocr_text(bwi2, psm=7, whitelist=WL),
-                ocr_text(bw2,  psm=6, whitelist=WL),
-                ocr_text(bwi2, psm=6, whitelist=WL),
-            ):
-                if txt:
-                    cand2_raw = txt
-                    break
-            if cand2_raw and not is_meta_line(cand2_raw):
-                owner2 = pick_owner_from_text(cand2_raw)
-
-        # ---- Combinar L1 + L2 y limpiar ----
-        combined = " ".join([s for s in (owner1, owner2) if s]).strip()
-        combined = trim_to_26_chars(combined)
+        # Combinar L1 + L2, limpiar y limitar
+        combined_raw = " ".join([s for s in (owner1, owner2) if s]).strip()
+        combined = trim_to_26_chars(combined_raw)
 
         attempts.append((attempt, x0, y0, x1, y1, combined))
+        # umbral mínimo razonable
         if combined and len(combined) >= 10:
             return combined, (x0, y0, x1, y1), attempt
 
-    # si no se alcanzó umbral, devolver el más largo
-    best = max(attempts, key=lambda t: len(t[5]) if t[5] else 0)
+    # Si no alcanza el umbral, devuelvo el más largo de los intentos
+    best = max(attempts, key=lambda t: len(t[5]) if t[5] else 0) if attempts else (0,0,0,0,0,"")
     return best[5], (best[1], best[2], best[3], best[4]), best[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
