@@ -1,3 +1,4 @@
+# app.py — AutoCatastro AI v0.4.1 (revisada)
 from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query
 from pydantic import BaseModel, AnyHttpUrl
 from starlette.responses import StreamingResponse
@@ -8,7 +9,6 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
-import pytesseract
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
@@ -21,12 +21,6 @@ app = FastAPI(title="AutoCatastro AI", version="0.4.1")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
-
-# Knobs de layout (ajustables sin redeploy)
-OWNER_X0_FRAC = float(os.getenv("OWNER_X0_FRAC", "0.38"))  # inicio columna "Apellidos…"
-OWNER_X1_FRAC = float(os.getenv("OWNER_X1_FRAC", "0.70"))  # fin columna "Apellidos…"
-ROW_GAP_PX    = int(os.getenv("ROW_GAP_PX", "260"))        # separador entre filas (img px @ ~400dpi)
-HEADER_WINDOW = int(os.getenv("HEADER_WINDOW", "12"))      # ventana de líneas para fallback textual
 
 def check_token(x_autocata_token: str = Header(default="")):
     if AUTH_TOKEN and x_autocata_token != AUTH_TOKEN:
@@ -48,10 +42,12 @@ class ExtractOut(BaseModel):
 # Utilidades PDF / Texto
 # ──────────────────────────────────────────────────────────────────────────────
 UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+
 STOP_IN_NAME = (
-    "POLÍGONO","POLIGONO","PARCELA","COORDENADAS","ETRS","HUSO","ESCALA",
-    "TITULARIDAD","VALOR CATASTRAL","LOCALIZACIÓN","LOCALIZACION","REFERENCIA CATASTRAL",
-    "APELLIDOS NOMBRE","RAZON SOCIAL","NIF","DOMICILIO","[","]","(",")"
+    "POLÍGONO", "POLIGONO", "PARCELA", "[", "]", "(", ")",
+    "COORDENADAS", "ETRS", "HUSO", "ESCALA", "TITULARIDAD",
+    "VALOR CATASTRAL", "LOCALIZACIÓN", "LOCALIZACION",
+    "REFERENCIA CATASTRAL", "NIF", "DOMICILIO"
 )
 
 def fetch_pdf_bytes(url: str) -> bytes:
@@ -72,266 +68,320 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\n{2,}", "\n", s)
     return s.strip()
 
-def is_upper_name(line: str, maxlen: int = 26) -> bool:
+def is_upper_name(line: str) -> bool:
     line = line.strip()
-    if not line or len(line) > maxlen:
+    if not line:
         return False
     U = line.upper()
+    # descartar líneas obvias que no son nombre
     for bad in STOP_IN_NAME:
         if bad in U:
             return False
-    if any(ch.isdigit() for ch in line):
+    # demasiados dígitos → no es nombre
+    if sum(ch.isdigit() for ch in line) >= 1:
+        return False
+    # longitud máxima típica observada
+    if len(line) > 26:
         return False
     return bool(UPPER_NAME_RE.match(line))
 
-def reconstruct_owner(lines: List[str]) -> str:
-    """Une hasta 2 líneas en mayúsculas en un nombre razonable."""
-    picked = [re.sub(r"\s+"," ",ln.strip()) for ln in lines if ln.strip()]
-    name = " ".join(picked)
-    name = re.sub(r"\s{2,}", " ", name).strip()
-    return name
+def owners_by_blocks_page2(pdf_bytes: bytes) -> List[str]:
+    """
+    Divide la página 2 en 'bloques' usando ocurrencias de 'Referencia catastral'
+    y, dentro de cada bloque, tras 'Titularidad principal' toma 1–2 líneas en
+    MAYÚSCULAS (≤26 chars, sin dígitos). Devuelve una lista de titulares por orden.
+    """
+    owners: List[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if len(pdf.pages) < 2:
+            return owners
+        p2 = pdf.pages[1]
+        text = normalize_text(p2.extract_text(x_tolerance=2, y_tolerance=2) or "")
+        lines = text.split("\n")
+
+    # índices donde empiezan bloques (aparición de "Referencia catastral")
+    idxs = [i for i, ln in enumerate(lines) if "REFERENCIA CATASTRAL" in ln.upper()]
+    if not idxs:
+        return owners
+    idxs.append(len(lines))  # centinela
+
+    for b in range(len(idxs) - 1):
+        lo, hi = idxs[b], idxs[b+1]
+        block = lines[lo:hi]
+
+        # buscar punto de arranque tras cabecera "Titularidad principal" o
+        # cabecera de tabla "Apellidos Nombre / Razón social"
+        start = 0
+        for j, ln in enumerate(block):
+            U = ln.upper()
+            if "TITULARIDAD PRINCIPAL" in U or ("APELLIDOS NOMBRE" in U and "RAZON" in U):
+                start = j + 1
+                break
+
+        # Ventana de hasta 12 líneas desde 'start' (permite separación por NIF/Domicilio)
+        win = block[start:start + 12]
+
+        picks: List[str] = []
+        for ln in win:
+            if is_upper_name(ln):
+                picks.append(ln.strip())
+            if len(picks) >= 2:
+                break
+
+        if picks:
+            # unir si hay dos líneas de nombre (e.g. “… JOSE” + “LUIS”)
+            owner = " ".join(picks)
+            owner = re.sub(r"\s{2,}", " ", owner).strip()
+            owners.append(owner)
+        else:
+            owners.append("")  # no encontrado en este bloque
+
+    return owners
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenCV helpers (con fallbacks)
+# OpenCV helpers (seguros en entornos slim)
 # ──────────────────────────────────────────────────────────────────────────────
 def cv_flag(name: str, default: int = 0) -> int:
     return int(getattr(cv2, name, default))
+
 THRESH_BINARY     = cv_flag("THRESH_BINARY", 0)
-THRESH_BINARY_INV = cv_flag("THRESH_BINARY_INV", 0)
-THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
+MORPH_OPEN        = cv_flag("MORPH_OPEN", 2)
+MORPH_CLOSE       = cv_flag("MORPH_CLOSE", 3)
+COLOR_BGR2HSV     = cv_flag("COLOR_BGR2HSV", 40)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Rasterización / color
+# Visión por computador (página 2)
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
-    dpi = 400 if FAST_MODE else 550
+    dpi = 380 if FAST_MODE else 520
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
-    return np.array(pages[0].convert("RGB"))[:, :, ::-1]  # RGB→BGR
+    pil: Image.Image = pages[0].convert("RGB")
+    return np.array(pil)[:, :, ::-1]  # RGB→BGR
 
-def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
+def crop_maps_band(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
+    """
+    Recorta la banda horizontal donde aparecen mini-mapas (izquierda).
+    Devuelve (crop, (ox,oy)) en coords de página.
+    """
     h, w = bgr.shape[:2]
-    top = int(h * 0.12); bottom = int(h * 0.92)
-    left = int(w * 0.08); right = int(w * 0.92)
+    top = int(h * 0.18); bottom = int(h * 0.95)   # fuera cabecera y pie
+    left = int(w * 0.05); right = int(w * 0.40)   # banda de mini-mapas
     top = max(0, top); bottom = min(h, bottom)
     left = max(0, left); right = min(w, right)
-    if bottom - top < 100 or right - left < 100:
-        return bgr, (0, 0)
     return bgr[top:bottom, left:right], (left, top)
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    g_ranges = [ (np.array([35,20,50],np.uint8), np.array([85,255,255],np.uint8)),
-                 (np.array([86,15,50],np.uint8), np.array([100,255,255],np.uint8)) ]
-    p_ranges = [ (np.array([160,20,80],np.uint8), np.array([179,255,255],np.uint8)),
-                 (np.array([  0,20,80],np.uint8), np.array([ 10,255,255],np.uint8)) ]
+    hsv = cv2.cvtColor(bgr, COLOR_BGR2HSV)
+    # Verde (parcela propia)
+    g_ranges = [
+        (np.array([35,  20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
+        (np.array([86,  15, 50], np.uint8), np.array([100,255,255], np.uint8)),
+    ]
+    # Rosa (vecinos)
+    p_ranges = [
+        (np.array([160, 20, 80], np.uint8), np.array([179,255,255], np.uint8)),
+        (np.array([  0, 20, 80], np.uint8), np.array([ 10,255,255], np.uint8)),
+    ]
     mg = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
+    for lo, hi in g_ranges:
+        mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     mp = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in p_ranges: mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
-    k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
-    mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3); mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
-    mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
+    for lo, hi in p_ranges:
+        mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
+
+    k3 = np.ones((3,3), np.uint8)
+    k5 = np.ones((5,5), np.uint8)
+    mg = cv2.morphologyEx(mg, MORPH_OPEN, k3)
+    mg = cv2.morphologyEx(mg, MORPH_CLOSE, k5)
+    mp = cv2.morphologyEx(mp, MORPH_OPEN, k3)
+    mp = cv2.morphologyEx(mp, MORPH_CLOSE, k5)
     return mg, mp
 
-def contours_centroids(mask: np.ndarray, min_area: int = 200) -> List[Tuple[int,int,int]]:
+def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < min_area: continue
+        if a < min_area:
+            continue
         M = cv2.moments(c)
-        if M["m00"] == 0: continue
+        if M["m00"] == 0:
+            continue
         cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
         out.append((cx, cy, int(a)))
-    out.sort(key=lambda x: -x[2])
+    out.sort(key=lambda x: x[1])  # por Y ascendente (fila superior→inferior)
     return out
 
 def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
-    cx, cy = main_xy; x, y = pt_xy
-    ang = math.degrees(math.atan2(-(y-cy), x-cx))  # Norte arriba
+    cx, cy = main_xy
+    x, y   = pt_xy
+    sx, sy = x - cx, y - cy
+    ang = math.degrees(math.atan2(-(sy), sx))  # Norte arriba
     if -45 <= ang <= 45: return "este"
     if 45 < ang <= 135:  return "norte"
     if -135 <= ang < -45:return "sur"
     return "oeste"
 
-def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
-    cfg = f"--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789"
-    data = pytesseract.image_to_string(img, config=cfg) or ""
-    return re.sub(r"\D+", "", data)
+def segment_rows_and_sides(bgr: np.ndarray) -> List[dict]:
+    """
+    Detecta filas (mini-mapas) y, por fila, calcula:
+    - centro verde (parcela objetivo) si existe
+    - centro rosa más cercano (vecino)
+    - lado (N/S/E/O) según vector verde→rosa
+    Devuelve lista de dicts ordenados de arriba a abajo.
+    """
+    band, (ox, oy) = crop_maps_band(bgr)
+    mg, mp = color_masks(band)
 
-def read_parcel_number_at(bgr: np.ndarray, center: Tuple[int,int], box: int = 110) -> str:
-    x, y = center; h, w = bgr.shape[:2]; half = box // 2
-    x0, y0 = max(0, x-half), max(0, y-half)
-    x1, y1 = min(w, x+half), min(h, y+half)
-    crop = bgr[y0:y1, x0:x1]
-    if crop.size == 0: return ""
-    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(g, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
-    flags_bin = THRESH_BINARY | (THRESH_OTSU if THRESH_OTSU else 0)
-    flags_inv = THRESH_BINARY_INV | (THRESH_OTSU if THRESH_OTSU else 0)
-    _, bw  = cv2.threshold(g, 0 if THRESH_OTSU else 127, 255, flags_bin)
-    _, bwi = cv2.threshold(g, 0 if THRESH_OTSU else 127, 255, flags_inv)
-    for p in (7,6):
-        for var in (bw,bwi):
-            txt = ocr_digits(var, psm=p)
-            if txt: return txt
-    return ""
+    # Áreas mínimas bajas para no perder verdes pequeños
+    min_g = 120 if FAST_MODE else 90
+    min_p = 120 if FAST_MODE else 90
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Segmentación por filas (imagen) + ROI de texto por fila
-# ──────────────────────────────────────────────────────────────────────────────
-def segment_rows_and_sides(bgr: np.ndarray) -> Tuple[List[dict], np.ndarray]:
-    """Devuelve filas con centros (verde/rojo), lado, y ROI texto en coords IMG."""
-    vis = bgr.copy()
-    crop, (ox, oy) = crop_map(bgr)
-    mg, mp = color_masks(crop)
+    greens = contours_centroids(mg, min_g)
+    pinks  = contours_centroids(mp, min_p)
 
-    greens = [(x+ox,y+oy,a) for (x,y,a) in contours_centroids(mg, 200)]
-    reds   = [(x+ox,y+oy,a) for (x,y,a) in contours_centroids(mp, 180)]
+    rows: List[dict] = []
 
-    # Agrupar rojos por Y en filas
-    reds_sorted = sorted(reds, key=lambda t: t[1])
-    rows: List[List[Tuple[int,int,int]]] = []
-    for pt in reds_sorted:
-        if not rows or abs(pt[1]-rows[-1][-1][1]) > ROW_GAP_PX:
-            rows.append([pt])
+    # Si no se detecta verde en alguna fila, intentaremos usar solo rosa (menos fiable)
+    # Emparejamos por proximidad vertical
+    all_y = sorted(set([gy for _,gy,_ in greens] + [py for _,py,_ in pinks]))
+    if not all_y:
+        return rows
+
+    # Agrupar por Y con umbral (altura típica de mini-mapa)
+    groups: List[List[int]] = []
+    thr = 140  # píxeles
+    for y in all_y:
+        if not groups or abs(y - groups[-1][-1]) > thr:
+            groups.append([y])
         else:
-            rows[-1].append(pt)
+            groups[-1].append(y)
 
-    H, W = bgr.shape[:2]
-    x0_owner = int(W * OWNER_X0_FRAC)
-    x1_owner = int(W * OWNER_X1_FRAC)
+    for g in groups:
+        yc = int(sum(g)/len(g))
+        # mejor centro verde de la banda alrededor de yc
+        gv = None; best_d = 10**9
+        for (xg, yg, _a) in greens:
+            d = abs(yg - yc)
+            if d < best_d:
+                best_d = d; gv = (xg, yg)
+        # mejor vecino rosa junto a ese verde (o al yc si gv es None)
+        nv = None; best2 = 10**9
+        anchor_y = gv[1] if gv else yc
+        for (xp, yp, _a) in pinks:
+            d = abs(yp - anchor_y)
+            if d < best2:
+                best2 = d; nv = (xp, yp)
+        side = ""
+        if gv and nv:
+            side = side_of((gv[0]+ox, gv[1]+oy), (nv[0]+ox, nv[1]+oy))
 
-    rows_info: List[dict] = []
-    for idx, cluster in enumerate(rows):
-        ys = [p[1] for p in cluster]; y_min, y_max = min(ys), max(ys)
-        pad = 120
-        r_y0 = max(0, y_min - pad); r_y1 = min(H, y_max + pad)
-
-        # main = verde más grande próximo a esta banda vertical
-        g_band = [g for g in greens if r_y0 <= g[1] <= r_y1]
-        main_pt = g_band[0] if g_band else None
-
-        # vecino = rojo del cluster más cercano al main; si no hay main, coge el central del cluster
-        if main_pt:
-            neigh_pt = min(cluster, key=lambda p: (p[0]-main_pt[0])**2 + (p[1]-main_pt[1])**2)
-            side = side_of((main_pt[0],main_pt[1]), (neigh_pt[0],neigh_pt[1]))
-        else:
-            neigh_pt = cluster[len(cluster)//2]
-            side = ""
-
-        rows_info.append({
-            "row_index": idx,
-            "main_center": (int(main_pt[0]), int(main_pt[1])) if main_pt else None,
-            "neigh_center": (int(neigh_pt[0]), int(neigh_pt[1])) if neigh_pt else None,
-            "side": side,
-            "img_owner_roi": [x0_owner, int(r_y0), x1_owner, int(r_y1)],  # [x0,y0,x1,y1] en IMG
+        rows.append({
+            "row_index": len(rows),
+            "main_center": (gv[0]+ox, gv[1]+oy) if gv else None,
+            "neigh_center": (nv[0]+ox, nv[1]+oy) if nv else None,
+            "side": side
         })
 
-        # Visual
-        if main_pt:
-            cv2.circle(vis, (main_pt[0],main_pt[1]), 10, (0,255,0), -1)
-        if neigh_pt:
-            cv2.circle(vis, (neigh_pt[0],neigh_pt[1]), 8, (0,0,255), -1)
-        if side:
-            cv2.putText(vis, side[:1].upper(), (neigh_pt[0]+8,neigh_pt[1]-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-
-    return rows_info, vis
+    return rows
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Texto posicional por ROI (pdfplumber.words → líneas → nombre)
+# Emparejar filas ↔ titulares y formar linderos
 # ──────────────────────────────────────────────────────────────────────────────
-def words_in_bbox(page: pdfplumber.page.Page, bbox_pdf: Tuple[float,float,float,float]) -> List[dict]:
-    x0,y0,x1,y1 = bbox_pdf
-    words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
-    out = []
-    for w in words:
-        if (w["x0"] >= x0 and w["x1"] <= x1 and w["top"] >= y0 and w["bottom"] <= y1):
-            out.append(w)
-    return out
+def assign_linderos_from_rows(rows: List[dict], owners_seq: List[str]) -> Tuple[Dict[str,str], List[dict]]:
+    """
+    Cruza filas detectadas (ordenadas arriba→abajo) con lista de titulares por
+    bloque de texto (también arriba→abajo). Asigna linderos por lado.
+    """
+    linderos = {"norte":"","sur":"","este":"","oeste":""}
+    debug_rows: List[dict] = []
 
-def lines_from_words(words: List[dict], y_tol: float = 3.0) -> List[str]:
-    if not words: return []
-    # agrupar por bandas horizontales
-    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-    lines: List[List[dict]] = []
-    for w in words:
-        if not lines or abs(w["top"] - lines[-1][-1]["top"]) > y_tol:
-            lines.append([w])
-        else:
-            lines[-1].append(w)
-    out = []
-    for ln in lines:
-        txt = " ".join([w["text"] for w in ln])
-        out.append(txt.strip())
-    return out
+    n = min(len(rows), len(owners_seq))
+    for i in range(n):
+        side = rows[i].get("side") or ""
+        owner = owners_seq[i].strip()
+        row_dbg = dict(rows[i])
+        row_dbg["owner"] = owner
+        debug_rows.append(row_dbg)
 
-def owner_from_roi(page: pdfplumber.page.Page,
-                   img_roi: List[int],
-                   img_size: Tuple[int,int]) -> str:
-    """Convierte ROI de IMG → PDF, extrae líneas y aplica reglas ≤26, MAYÚSC., sin dígitos."""
-    W_img, H_img = img_size
-    x0_i, y0_i, x1_i, y1_i = img_roi
+        if side and owner and not linderos.get(side):
+            linderos[side] = owner
 
-    # Map a coords PDF (escala lineal)
-    W_pdf, H_pdf = float(page.width), float(page.height)
-    sx, sy = W_pdf / float(W_img), H_pdf / float(H_img)
-    x0 = x0_i * sx; x1 = x1_i * sx; y0 = y0_i * sy; y1 = y1_i * sy
-    bbox_pdf = (x0, y0, x1, y1)
-
-    # Palabras → líneas
-    words = words_in_bbox(page, bbox_pdf)
-    lines = lines_from_words(words, y_tol=3.5)
-
-    # Filtrado por reglas
-    candidates = [ln for ln in lines if is_upper_name(ln, maxlen=26)]
-    if not candidates:
-        # Fallback muy corto: busca dos seguidas válidas dentro de HEADER_WINDOW líneas
-        short = []
-        for ln in lines[:HEADER_WINDOW]:
-            if is_upper_name(ln, maxlen=26):
-                short.append(ln)
-                if len(short) == 2: break
-        candidates = [" ".join(short)] if short else []
-
-    if candidates:
-        # preferir la más larga pero ≤26
-        best = sorted(candidates, key=lambda s: len(s), reverse=True)[0]
-        # segunda línea opcional si cabe y es válida
-        extra = ""
-        for ln in lines:
-            if ln == best: continue
-            if is_upper_name(ln, maxlen=26) and len(best) + 1 + len(ln) <= 26:
-                extra = ln; break
-        return reconstruct_owner([best] + ([extra] if extra else []))
-    return ""
+    return linderos, debug_rows
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Detección completa por filas (imagen + texto)
+# Endpoints
 # ──────────────────────────────────────────────────────────────────────────────
-def detect_by_rows_and_text(pdf_bytes: bytes) -> Tuple[Dict[str,str], dict, np.ndarray]:
+@app.get("/health")
+def health():
+    return {"ok": True, "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY}
+
+@app.get("/preview", dependencies=[Depends(check_token)])
+def preview_get(pdf_url: AnyHttpUrl = Query(...), labels: int = Query(0)):
+    pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     bgr = page2_bgr(pdf_bytes)
-    rows_info, vis = segment_rows_and_sides(bgr)
 
-    # Abrir página 2 para texto posicional
-    page2 = None
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        if len(pdf.pages) >= 2:
-            page2 = pdf.pages[1]
+    rows = segment_rows_and_sides(bgr)
 
-        owners_rows = []
-        linderos = {"norte":"","sur":"","este":"","oeste":""}
+    vis = bgr.copy()
+    # Dibujo
+    for r in rows:
+        if r["main_center"]:
+            cv2.circle(vis, r["main_center"], 10, (0,255,0), -1)
+        if r["neigh_center"]:
+            cv2.circle(vis, r["neigh_center"], 8, (0,0,255), -1)
+        if labels and r["side"]:
+            ch = {"norte":"N","sur":"S","este":"E","oeste":"O"}[r["side"]]
+            pt = r["neigh_center"] or r["main_center"]
+            if pt:
+                cv2.putText(vis, ch, (pt[0]+6, pt[1]-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 3, cv2.LINE_AA)
 
-        for row in rows_info:
-            owner = ""
-            if page2:
-                owner = owner_from_roi(page2, row["img_owner_roi"], (bgr.shape[1], bgr.shape[0]))
-            row["owner"] = owner
-            owners_rows.append(owner)
-            if row.get("side") and owner:
-                # Asignar
+    ok, png = cv2.imencode(".png", vis)
+    if not ok:
+        raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
+    return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
+
+@app.post("/preview", dependencies=[Depends(check_token)])
+def preview_post(data: ExtractIn = Body(...), labels: int = Query(0)):
+    return preview_get(pdf_url=data.pdf_url, labels=labels)
+
+@app.post("/extract", response_model=ExtractOut, dependencies=[Depends(check_token)])
+def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
+    pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
+
+    # 1) Texto página 2 → titulares por bloque
+    owners_seq = owners_by_blocks_page2(pdf_bytes)
+
+    if TEXT_ONLY:
+        owners_detected = [o for o in owners_seq if o][:8]
+        note = "Modo TEXT_ONLY activo."
+        dbg = {"owners_blocks": owners_seq} if debug else None
+        return ExtractOut(linderos={"norte":"","sur":"","este":"","oeste":""},
+                          owners_detected=owners_detected, note=note, debug=dbg)
+
+    # 2) Visión: filas y lados
+    bgr = page2_bgr(pdf_bytes)
+    rows = segment_rows_and_sides(bgr)
+
+    # 3) Emparejar por orden y formar linderos
+    linderos, dbg_rows = assign_linderos_from_rows(rows, owners_seq)
+    owners_detected = [o for o in owners_seq if o][:8]
+
+    note = None
+    if not any(linderos.values()):
+        note = "No se pudo determinar lado/vecino con suficiente confianza."
+
+    dbg = None
+    if debug:
+        dbg = {
+            "rows": dbg_rows,
+            "owners_rows": owners_seq
+        }
+
+    return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
+
 
 
