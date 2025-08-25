@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.5")
+app = FastAPI(title="AutoCatastro AI", version="0.4.6")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -71,7 +71,7 @@ THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
 # Raster (pág. 2) y masks
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
-    dpi = 400 if FAST_MODE else 500  # un poco más para no “comer” bordes de letras
+    dpi = 400 if FAST_MODE else 500
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
@@ -124,7 +124,6 @@ def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
 # OCR utils
 # ──────────────────────────────────────────────────────────────────────────────
 def enhance_gray(g: np.ndarray) -> np.ndarray:
-    """Contraste local para mejorar trazos finos."""
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     return clahe.apply(g)
 
@@ -155,30 +154,26 @@ def pick_owner_from_text(txt: str) -> str:
         if sum(ch.isdigit() for ch in U) > 1: continue
         if any(tok in U for tok in BAD_TOKENS): continue
         if not UPPER_NAME_RE.match(U): continue
-        if 6 <= len(U) <= 34: idxs.append(i)
+        if 5 <= len(U) <= 40: idxs.append(i)
     if not idxs: return ""
     i0 = idxs[0]
     cand = lines[i0].upper()
-    # posible segunda línea (“… JOSE” + “LUIS”)
+    # concatenar segunda línea si cabe (JOSE + LUIS)
     if i0 + 1 < len(lines):
         nxt = lines[i0+1].strip().upper()
         if (UPPER_NAME_RE.match(nxt)
             and not any(tok in nxt for tok in BAD_TOKENS)
             and sum(ch.isdigit() for ch in nxt) <= 1
-            and len(cand) + 1 + len(nxt) <= 36):
+            and len(cand) + 1 + len(nxt) <= 42):
             cand = f"{cand} {nxt}"
     return cand
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar columna “Apellidos…” cerca de cada fila y extraer el titular
+# Localizar columna “Apellidos…” y extraer el titular por fila
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int) -> Tuple[int,int,int]:
-    """
-    Devuelve (x_left_col, x_right_col, y_header_bottom).
-    Si no hay detección fiable, usa una heurística (55% de ancho del bloque).
-    """
     h, w = bgr.shape[:2]
-    pad_y = int(h * 0.04)
+    pad_y = int(h * 0.05)
     y0 = max(0, row_y - pad_y)
     y1 = min(h, row_y + pad_y)
 
@@ -204,18 +199,18 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
         for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
             if not t: continue
             T = t.upper()
-            if "APELLIDOS" in T:  # primera columna
+            if "APELLIDOS" in T:
                 saw_apellidos = True
                 y_bottom_header = max(y_bottom_header or 0, ty + hh)
-            if T == "NIF":        # límite derecho de la 1ª columna
+            if T == "NIF":
                 x_nif = lx
                 y_bottom_header = max(y_bottom_header or 0, ty + hh)
 
-        if x_nif is not None and (saw_apellidos or y_bottom_header is not None):
+        if x_nif is not None:
             x_left  = x_text0
             x_right = min(x_text1, x_text0 + x_nif - 8)
             y_base  = y0 + (y_bottom_header or 0)
-            if x_right - x_left > (x_text1 - x_text0) * 0.25:
+            if x_right - x_left > (x_text1 - x_text0) * 0.22:
                 return x_left, x_right, y_base
 
     x_left  = x_text0
@@ -223,49 +218,65 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
     y_base  = y0 + (y1-y0)//2
     return x_left, x_right, y_base
 
-def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,int,int,int]]:
+def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,int,int,int], int]:
     """
-    Recorta la celda 'Apellidos…' de la fila centrada en row_y y extrae el nombre.
-    Devuelve (owner, (x0,y0,x1,y1)) para debug.
+    Devuelve (owner, (x0,y0,x1,y1), attempt_used)
+    Hace hasta 3 intentos, expandiendo a la izquierda si el texto sale “corto”.
     """
     h, w = bgr.shape[:2]
-    # bloque de texto (lado derecho)
-    x_text0 = int(w * 0.40)
+    x_text0 = int(w * 0.36)  # más a la izquierda
     x_text1 = int(w * 0.96)
 
     x_col0, x_col1, y_header = find_header_columns(bgr, row_y, x_text0, x_text1)
 
-    # === expansión para no cortar letras de inicio ===
-    pad_left_px  = max(8, int(w * 0.02))
-    pad_right_px = max(6, int(w * 0.005))
-    x0 = max(0, x_col0 - pad_left_px)
-    x1 = min(w, x_col1 + pad_right_px)
+    base_pad_left  = max(24, int(w * 0.045))
+    base_pad_right = max(8,  int(w * 0.008))
 
-    y0 = max(0, y_header + 6)
-    y1 = min(h, row_y + int(h * (0.08 if FAST_MODE else 0.10)))
-
-    roi = bgr[y0:y1, x0:x1]
-    if roi.size == 0:
-        return "", (x0,y0,x1,y1)
-
-    g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-    g = enhance_gray(g)
-    bw, bwi = binarize(g)
+    # altura de la celda
+    y0_base = max(0, y_header + 6)
+    y1_base = min(h, row_y + int(h * (0.10 if FAST_MODE else 0.12)))
 
     WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-    variants = [
-        ocr_text(bw,  psm=6,  whitelist=WL),
-        ocr_text(bwi, psm=6,  whitelist=WL),
-        ocr_text(bw,  psm=7,  whitelist=WL),
-        ocr_text(bwi, psm=7,  whitelist=WL),
-        ocr_text(bw,  psm=13, whitelist=WL),  # raw line
-    ]
-    for txt in variants:
-        owner = pick_owner_from_text(txt)
+    attempts = []
+    for attempt in range(3):
+        extra_left = attempt * max(18, int(w * 0.03))
+        x0 = max(0, x_col0 - base_pad_left - extra_left)
+        x1 = min(w, x_col1 + base_pad_right)
+        y0, y1 = y0_base, y1_base
+
+        roi = bgr[y0:y1, x0:x1]
+        if roi.size == 0:
+            attempts.append((attempt, x0,y0,x1,y1,""))
+            continue
+
+        g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+        g = enhance_gray(g)
+        bw, bwi = binarize(g)
+
+        variants = [
+            ocr_text(bw,  psm=6,  whitelist=WL),
+            ocr_text(bwi, psm=6,  whitelist=WL),
+            ocr_text(bw,  psm=7,  whitelist=WL),
+            ocr_text(bwi, psm=7,  whitelist=WL),
+            ocr_text(bw,  psm=13, whitelist=WL),
+        ]
+        owner = ""
+        for txt in variants:
+            owner = pick_owner_from_text(txt)
+            if owner:
+                break
+
+        attempts.append((attempt, x0,y0,x1,y1, owner))
+        # si el nombre parece “mordido” (muy corto o 1 palabra corta), expandimos más
         if owner:
-            return owner, (x0,y0,x1,y1)
-    return "", (x0,y0,x1,y1)
+            parts = [p for p in owner.split() if p]
+            if len(owner) >= 10 and (len(parts) >= 2 or len(owner) >= 14):
+                return owner, (x0,y0,x1,y1), attempt
+
+    # si ninguno “canta”, devolvemos el mejor (más largo)
+    best = max(attempts, key=lambda t: len(t[5]) if t[5] else 0)
+    return best[5], (best[1],best[2],best[3],best[4]), best[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline por filas
@@ -305,7 +316,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and best_d < (w*0.25)**2:
             side = side_of((mcx, mcy), best)
 
-        owner, (x0,y0,x1,y1) = extract_owner_from_row(bgr, row_y=mcy)
+        owner, (x0,y0,x1,y1), attempt_id = extract_owner_from_row(bgr, row_y=mcy)
 
         if side and owner and side not in used_sides:
             linderos[side] = owner
@@ -324,7 +335,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
                 cv2.putText(vis, owner[:28], (int(w*0.42), mcy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
-            # rectángulo del ROI de texto (debug visual)
             cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
 
         rows_dbg.append({
@@ -333,6 +343,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "neigh_center": list(best) if best is not None else None,
             "side": side,
             "owner": owner,
+            "roi_attempt": attempt_id,
             "x_col0": x0, "x_col1": x1
         })
 
@@ -415,5 +426,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
