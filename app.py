@@ -263,33 +263,64 @@ def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
 def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,int,int,int], int]:
     """
     Devuelve (owner, (x0,y0,x1,y1), attempt_used)
-    Hace hasta 3 intentos, expandiendo a la izquierda si el texto sale “mordido”.
-    Si el nombre tiene ≤3 tokens, prueba a leer una SEGUNDA LÍNEA justo debajo
-    y la añade si son 1–2 tokens válidos (p.ej., 'JOSE LUIS').
+    1) Lee la línea de titular.
+    2) Si el nombre quedó corto (≤3 tokens útiles), escanea hasta 3 líneas por
+       debajo y añade 1 token de nombre (p.ej., 'LUIS'), ignorando líneas con NIF
+       o domicilio.
     """
     h, w = bgr.shape[:2]
     x_text0 = int(w * 0.33)
     x_text1 = int(w * 0.96)
 
     def ocr_owner_from_roi(roi: np.ndarray) -> str:
-        if roi.size == 0: return ""
+        if roi.size == 0:
+            return ""
         g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
         g = enhance_gray(g)
         bw, bwi = binarize(g)
         WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-        variants = [
+        variants = (
             ocr_text(bw,  psm=6,  whitelist=WL),
             ocr_text(bwi, psm=6,  whitelist=WL),
             ocr_text(bw,  psm=7,  whitelist=WL),
             ocr_text(bwi, psm=7,  whitelist=WL),
             ocr_text(bw,  psm=13, whitelist=WL),
-        ]
+        )
         for txt in variants:
             cand = pick_owner_from_text(txt)
             if cand:
                 return cand
         return ""
+
+    def count_core_tokens(name: str) -> int:
+        toks = [t for t in name.split() if t not in NAME_CONNECTORS]
+        return len(toks)
+
+    def want_more_tail(name: str) -> bool:
+        # Si hay ≤3 tokens “de persona”, intentamos captar “LUIS” en la línea inferior.
+        return count_core_tokens(name) <= 3
+
+    def pick_tail_token(txt: str, already: List[str]) -> Optional[str]:
+        """Devuelve un token de nombre (2–10 mayúsculas sin dígitos) que no esté ya."""
+        if not txt:
+            return None
+        txt = clean_owner_line(txt)
+        for raw in txt.split():
+            t = raw.strip()
+            if not t:
+                continue
+            if any(ch.isdigit() for ch in t):
+                continue
+            if t in BAD_TOKENS or t in GEO_TOKENS or t in NAME_CONNECTORS:
+                continue
+            # solo mayúsculas con acentos y longitud razonable (tipo 'LUIS')
+            if not re.fullmatch(r"[A-ZÁÉÍÓÚÜÑ]{2,10}", t):
+                continue
+            if t in already:
+                continue
+            return t
+        return None
 
     attempts = []
     for attempt in range(3):
@@ -297,34 +328,63 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
         x0_base = max(0, x_text0 - extra_left)
         x0, x1, y0, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
 
-        # — 1ª línea —
+        # 1) Línea principal
         roi1 = bgr[y0:y1, x0:x1]
         owner = ocr_owner_from_roi(roi1)
 
-        # — 2ª línea (opcional) si el nombre quedó corto —
-        if owner:
-            tokens_owner = owner.split()
-            if len([t for t in tokens_owner if t not in NAME_CONNECTORS]) <= 3:
-                y2a = min(h, y1 + int(h * 0.004))
-                y2b = min(h, y2a + int(h * 0.022))  # una línea pequeña
+        # 2) Si quedó corto, mirar hasta 3 "líneas" por debajo (saltando NIF/domicilio)
+        if owner and want_more_tail(owner):
+            base_tokens = owner.split()
+            line_h   = max(12, int(h * 0.022))   # alto de una línea típica
+            gap_h    = max(4,  int(h * 0.004))   # pequeño gap
+            added    = False
+
+            for k in range(1, 4):  # hasta 3 líneas siguientes
+                y2a = min(h, y1 + gap_h + (k-1) * (line_h + gap_h))
+                y2b = min(h, y2a + line_h)
                 roi2 = bgr[y2a:y2b, x0:x1]
-                extra = ocr_owner_from_roi(roi2)
-                if extra:
-                    # limpia y añade solo 1–2 tokens nuevos sin dígitos/ruido
-                    extra = clean_owner_line(extra)
-                    extra_tokens = [t for t in extra.split()
-                                    if not any(ch.isdigit() for ch in t)
-                                    and t not in BAD_TOKENS and t not in GEO_TOKENS
-                                    and t not in tokens_owner]
-                    if 1 <= len(extra_tokens) <= 2:
-                        owner = (owner + " " + " ".join(extra_tokens)).strip()
+                if roi2.size == 0:
+                    continue
 
-        attempts.append((attempt, x0,y0,x1,y1, owner))
+                # OCR de la sub-línea
+                g2 = cv2.cvtColor(roi2, cv2.COLOR_BGR2GRAY)
+                g2 = cv2.resize(g2, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+                g2 = enhance_gray(g2)
+                bw2, bwi2 = binarize(g2)
+                WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
+                tests = (
+                    ocr_text(bw2,  psm=7,  whitelist=WL),
+                    ocr_text(bwi2, psm=7,  whitelist=WL),
+                    ocr_text(bw2,  psm=6,  whitelist=WL),
+                    ocr_text(bwi2, psm=6,  whitelist=WL),
+                )
+                tail_txt = ""
+                for t in tests:
+                    if t:
+                        tail_txt = t
+                        break
+
+                # Si la línea contiene NIF/domicilio, la saltamos
+                U = (tail_txt or "").upper()
+                if any(key in U for key in ("NIF", "DOMICILIO", "CL ", "CALLE", "AV ", "AV.", "PL:", "PT:", "ES:", "PORTAL")):
+                    continue
+
+                # Intentar sacar 1 token usable (p.ej., 'LUIS')
+                tail_token = pick_tail_token(tail_txt, already=base_tokens)
+                if tail_token:
+                    owner = (owner + " " + tail_token).strip()
+                    added = True
+                    break  # con 1 token extra suele bastar
+
+            # (opcional) si no se añadió nada, lo dejamos tal cual
+
+        attempts.append((attempt, x0, y0, x1, y1, owner))
         if owner and len(owner) >= 10:
-            return owner, (x0,y0,x1,y1), attempt
+            return owner, (x0, y0, x1, y1), attempt
 
+    # devolver el mejor intento (el más largo)
     best = max(attempts, key=lambda t: len(t[5]) if t[5] else 0)
-    return best[5], (best[1],best[2],best[3],best[4]), best[0]
+    return best[5], (best[1], best[2], best[3], best[4]), best[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline por filas
