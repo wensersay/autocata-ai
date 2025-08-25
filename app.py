@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.10")
+app = FastAPI(title="AutoCatastro AI", version="0.4.11")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -104,7 +104,7 @@ def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
     k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
     mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3); mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
-    mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv5) if False else cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
+    mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
     return mg, mp
 
 def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
@@ -166,11 +166,9 @@ def clean_owner_line(line: str) -> str:
         out.append(t)
         if len([x for x in out if x not in NAME_CONNECTORS]) >= 5:
             break
-    # eliminar conectores al inicio
-    while out and out[0] in NAME_CONNECTORS:
+    while out and out[0] in NAME_CONNECTORS:  # sin conectores al inicio
         out.pop(0)
-    # si el primer token es demasiado corto, eliminarlo
-    if out and len(out[0]) < 3:
+    if out and len(out[0]) < 3:               # primer token debe ser real
         out.pop(0)
     name = " ".join(out).strip()
     return name[:48]
@@ -216,7 +214,7 @@ def first_token_len(name: str) -> int:
     return len(toks[0]) if toks else 0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar columna “Apellidos…” y extraer DOS líneas del titular
+# Localizar columna y extraer DOS líneas del titular (alineado real)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
                                 x_text0: int, x_text1: int) -> Tuple[int,int,int,int,int,int,dict]:
@@ -273,13 +271,16 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
             y0_line2 = min(h, y1_line1 + 2)
             y1_line2 = min(h, y0_line2 + line_h)
 
-            # Alineado real por la izquierda con margen
-            margin = 25 if FAST_MODE else 35
+            # margen adaptativo: si header_left es muy bajo, expandir mucho más
+            base_margin = 28 if FAST_MODE else 36
+            extra_margin = int(0.10 * (x_text1 - x_text0)) if (header_left is not None and header_left <= 6) else 0
+            margin = base_margin + extra_margin
+
             if header_left is not None:
                 x0 = max(0, x_text0 + header_left - margin)
             else:
                 x0 = max(0, x_text0 - int(0.02*(x_text1-x_text0)))
-            # Tope por NIF a la derecha (si existe)
+
             if x_nif is not None:
                 x1 = min(x_text1, x_text0 + x_nif - 8)
             else:
@@ -302,7 +303,8 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict, int]
     """
     Devuelve (owner_joined, debug_dict, attempt_used).
     Hasta 5 intentos, expandiendo x0 a la izquierda si muerde letras.
-    Rechaza resultados cuyo primer token < 3 caracteres (p.ej. 'MI ...').
+    Si header_left es muy pequeño (cabecera pegada al borde) no aceptamos
+    en intentos tempranos y forzamos más expansión a la izquierda.
     """
     h, w = bgr.shape[:2]
     x_text0 = int(w * 0.33)
@@ -310,8 +312,9 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict, int]
 
     best = ("", {"roi1":None,"roi2":None,"txt1":"","txt2":"","header_left":None,"x_nif":None}, -1)
 
-    for attempt in range(5):
-        extra_left = attempt * max(28, int(w * 0.07))  # más agresivo
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        extra_left = attempt * max(32, int(w * 0.08))  # expansión más agresiva
         x0_base = max(0, x_text0 - extra_left)
         x0, x1, y01, y11, y02, y12, dbg_hdr = find_header_and_owner_bands(bgr, row_y, x0_base, x_text1)
 
@@ -357,13 +360,18 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict, int]
 
         joined = join_name_lines(owner1, owner2, raw2=txt2)
 
-        # calidad mínima del primer token
+        # Calidad mínima + heurística de cabecera pegada (posible corte por la izquierda)
+        header_left = dbg_hdr.get("header_left")
         accept = bool(joined) and (first_token_len(joined) >= 3) and (len(joined) >= 10)
+
+        # si la cabecera está demasiado a la izquierda, no aceptamos temprano
+        if header_left is not None and header_left <= 6 and attempt < (max_attempts - 1):
+            accept = False  # fuerza más expansión hacia la izquierda
 
         cand_dbg = {
             "roi1":[x0,y01,x1,y11], "roi2":[x0,y02,x1,y12],
             "txt1":txt1, "txt2":txt2,
-            "header_left": dbg_hdr.get("header_left"),
+            "header_left": header_left,
             "x_nif": dbg_hdr.get("x_nif")
         }
 
@@ -372,7 +380,38 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict, int]
 
         if accept:
             return joined, cand_dbg, attempt
-        # si no aceptamos, seguimos expandiendo a la izquierda
+
+    # Panic-left final: un intento extra muy a la izquierda si quedó pobre
+    if not best[0] or first_token_len(best[0]) < 4:
+        x0_base = max(0, x_text0 - int(0.22 * w))
+        x0, x1, y01, y11, y02, y12, dbg_hdr = find_header_and_owner_bands(bgr, row_y, x0_base, x_text1)
+        roi1 = bgr[y01:y11, x0:x1]
+        roi2 = bgr[y02:y12, x0:x1]
+        owner1 = owner2 = ""
+        txt1 = txt2 = ""
+        if roi1.size:
+            g1 = cv2.cvtColor(roi1, cv2.COLOR_BGR2GRAY)
+            g1 = cv2.resize(g1, None, fx=1.45, fy=1.45, interpolation=cv2.INTER_CUBIC)
+            g1 = enhance_gray(g1)
+            bw1, bwi1 = binarize(g1)
+            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
+            for c in [ocr_text(bw1,7,WL), ocr_text(bwi1,7,WL), ocr_text(bw1,6,WL)]:
+                txt1 = c; owner1 = pick_owner_from_text(c)
+                if owner1: break
+        if roi2.size:
+            g2 = cv2.cvtColor(roi2, cv2.COLOR_BGR2GRAY)
+            g2 = cv2.resize(g2, None, fx=1.45, fy=1.45, interpolation=cv2.INTER_CUBIC)
+            g2 = enhance_gray(g2)
+            bw2, bwi2 = binarize(g2)
+            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
+            for c in [ocr_text(bw2,7,WL), ocr_text(bwi2,7,WL), ocr_text(bw2,6,WL)]:
+                txt2 = c; owner2 = pick_owner_from_text(c)
+                if owner2: break
+        joined = join_name_lines(owner1, owner2, raw2=txt2)
+        cand_dbg = {"roi1":[x0,y01,x1,y11], "roi2":[x0,y02,x1,y12], "txt1":txt1, "txt2":txt2,
+                    "header_left": dbg_hdr.get("header_left"), "x_nif": dbg_hdr.get("x_nif")}
+        if joined and len(joined) > len(best[0]):
+            return joined, cand_dbg, max_attempts
 
     return best[0], best[1], best[2]
 
@@ -535,6 +574,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
-
 
