@@ -264,27 +264,19 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
     """
     Devuelve (owner, (x0,y0,x1,y1), attempt_used)
     Hace hasta 3 intentos, expandiendo a la izquierda si el texto sale “mordido”.
+    Si el nombre tiene ≤3 tokens, prueba a leer una SEGUNDA LÍNEA justo debajo
+    y la añade si son 1–2 tokens válidos (p.ej., 'JOSE LUIS').
     """
     h, w = bgr.shape[:2]
-    x_text0 = int(w * 0.33)  # más a la izquierda para no perder primeras letras
+    x_text0 = int(w * 0.33)
     x_text1 = int(w * 0.96)
 
-    attempts = []
-    for attempt in range(3):
-        extra_left = attempt * max(18, int(w * 0.03))
-        x0_base = max(0, x_text0 - extra_left)
-        x0, x1, y0, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
-
-        roi = bgr[y0:y1, x0:x1]
-        if roi.size == 0:
-            attempts.append((attempt, x0,y0,x1,y1,""))
-            continue
-
+    def ocr_owner_from_roi(roi: np.ndarray) -> str:
+        if roi.size == 0: return ""
         g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
         g = enhance_gray(g)
         bw, bwi = binarize(g)
-
         WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
         variants = [
             ocr_text(bw,  psm=6,  whitelist=WL),
@@ -293,11 +285,39 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
             ocr_text(bwi, psm=7,  whitelist=WL),
             ocr_text(bw,  psm=13, whitelist=WL),
         ]
-        owner = ""
         for txt in variants:
-            owner = pick_owner_from_text(txt)
-            if owner:
-                break
+            cand = pick_owner_from_text(txt)
+            if cand:
+                return cand
+        return ""
+
+    attempts = []
+    for attempt in range(3):
+        extra_left = attempt * max(18, int(w * 0.03))
+        x0_base = max(0, x_text0 - extra_left)
+        x0, x1, y0, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
+
+        # — 1ª línea —
+        roi1 = bgr[y0:y1, x0:x1]
+        owner = ocr_owner_from_roi(roi1)
+
+        # — 2ª línea (opcional) si el nombre quedó corto —
+        if owner:
+            tokens_owner = owner.split()
+            if len([t for t in tokens_owner if t not in NAME_CONNECTORS]) <= 3:
+                y2a = min(h, y1 + int(h * 0.004))
+                y2b = min(h, y2a + int(h * 0.022))  # una línea pequeña
+                roi2 = bgr[y2a:y2b, x0:x1]
+                extra = ocr_owner_from_roi(roi2)
+                if extra:
+                    # limpia y añade solo 1–2 tokens nuevos sin dígitos/ruido
+                    extra = clean_owner_line(extra)
+                    extra_tokens = [t for t in extra.split()
+                                    if not any(ch.isdigit() for ch in t)
+                                    and t not in BAD_TOKENS and t not in GEO_TOKENS
+                                    and t not in tokens_owner]
+                    if 1 <= len(extra_tokens) <= 2:
+                        owner = (owner + " " + " ".join(extra_tokens)).strip()
 
         attempts.append((attempt, x0,y0,x1,y1, owner))
         if owner and len(owner) >= 10:
