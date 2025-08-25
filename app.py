@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query
 from pydantic import BaseModel, AnyHttpUrl
-from starlette.responses import StreamingResponse
+from starlette.responses import StreamingResponse, JSONResponse
 from typing import Dict, List, Optional, Tuple
 import requests, io, re, os, math
 import numpy as np
@@ -8,6 +8,7 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
+import pytesseract
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
@@ -38,8 +39,17 @@ class ExtractOut(BaseModel):
     debug: Optional[dict] = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades PDF / Texto (titulares POR COLUMNA en pág. 2)
+# Utilidades PDF / Texto
 # ──────────────────────────────────────────────────────────────────────────────
+UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+
+STOP_IN_NAME = (
+    "POLÍGONO", "POLIGONO", "PARCELA", "LOCALIZACIÓN", "LOCALIZACION",
+    "REFERENCIA CATASTRAL", "COORDENADAS", "ETRS", "HUSO", "ESCALA",
+    "TITULARIDAD", "VALOR CATASTRAL", "NIF", "DOMICILIO", "APELLIDOS NOMBRE",
+    "RAZON SOCIAL", "RAZÓN SOCIAL"
+)
+
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
         r = requests.get(url, timeout=60)
@@ -52,122 +62,90 @@ def fetch_pdf_bytes(url: str) -> bytes:
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Error de red al descargar el PDF: {e}")
 
-UPPER_TOKEN = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\.\-\' ]+$")
+def normalize_text(s: str) -> str:
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{2,}", "\n", s)
+    return s.strip()
 
-def owners_by_column_page2(pdf_bytes: bytes) -> List[dict]:
-    """
-    Lee SOLO la columna 'Apellidos Nombre / Razón social' bajo su cabecera.
-    Devuelve [{y, x0, x1, name}] por fila detectada (y ~ línea de cabecera).
-    """
-    owners: List[dict] = []
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            if len(pdf.pages) < 2:
-                return owners
-            p2 = pdf.pages[1]
-            words = p2.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
-    except Exception:
-        return owners
+def is_upper_name(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+    U = line.upper()
+    if any(bad in U for bad in STOP_IN_NAME):
+        return False
+    # demasiados números → probablemente NIF/dirección
+    if sum(ch.isdigit() for ch in line) >= 2:
+        return False
+    return bool(UPPER_NAME_RE.match(line))
 
-    from collections import defaultdict
-    rows = defaultdict(list)
-    for w in words:
-        rows[int(round(w["top"]))].append(w)
-
-    headers = []  # (y_hdr, x0_name, x0_nif)
-    for y, ws in rows.items():
-        tokens = [w["text"].upper() for w in ws]
-        if "NIF" in tokens and any(t in tokens for t in ("APELLIDOS","NOMBRE","RAZÓN","RAZON","SOCIAL")):
-            try:
-                x0_nif  = min(w["x0"] for w in ws if w["text"].upper() == "NIF")
-                x0_name = min(w["x0"] for w in ws if w["text"].upper() in ("APELLIDOS","NOMBRE","RAZÓN","RAZON","SOCIAL","/"))
-                headers.append((y, x0_name, x0_nif))
-            except ValueError:
-                continue
-    headers.sort(key=lambda t: t[0])
-    if not headers:
-        return owners
-
-    # Para cada cabecera, leer palabras en la banda vertical de esa "tarjeta"
-    for i, (y_hdr, x0_name, x0_nif) in enumerate(headers):
-        y_lo = y_hdr + 2
-        # a falta de otra cabecera: ventana conservadora
-        y_hi = headers[i+1][0] - 2 if i + 1 < len(headers) else y_hdr + (140 if FAST_MODE else 170)
-
-        col_words = [w for w in words
-                     if y_lo <= w["top"] <= y_hi and (x0_name - 2) <= w["x0"] <= (x0_nif - 2)]
-        col_words.sort(key=lambda w: (w["top"], w["x0"]))
-
-        toks = []
-        for w in col_words:
-            t = (w["text"] or "").strip()
-            if not t or any(ch.isdigit() for ch in t):  # corta números/NIF dentro de la columna
-                continue
-            if UPPER_TOKEN.match(t):
-                toks.append(t)
-
-        txt = " ".join(toks)
-        # corta en posibles patrones numéricos largos o NIF
-        txt = re.split(r"\b\d{5,}|\b\d{8}[A-Z]\b", txt)[0].strip()
-        # Límite 26 chars respetando palabra
-        if len(txt) > 26:
-            cut = txt[:26]
-            txt = cut[:cut.rfind(" ")] if " " in cut else cut
-
-        if txt:
-            owners.append({"y": y_hdr, "x0": x0_name, "x1": x0_nif, "name": txt})
-    return owners
-
-def pick_owner_for_y(owners_rows: List[dict], y: int) -> str:
-    if not owners_rows:
-        return ""
-    best = min(owners_rows, key=lambda o: abs(o["y"] - y))
-    return (best.get("name") or "").strip()
+def reconstruct_owner(lines: List[str]) -> str:
+    """Une 1–2 líneas MAYÚSCULAS en un nombre. Limita a ≈ 32–36 chars."""
+    joined = " ".join([re.sub(r"\s+", " ", L.strip()) for L in lines if L.strip()])
+    joined = re.sub(r"\s{2,}", " ", joined).strip()
+    # regla de 26–36 caracteres (evita domicilios largos)
+    if len(joined) > 36:
+        # si es muy largo, quédate con primeras ~32 sin cortar palabra
+        parts = joined.split(" ")
+        acc = []
+        for p in parts:
+            if len(" ".join(acc + [p])) > 32:
+                break
+            acc.append(p)
+        joined = " ".join(acc) if acc else joined[:32]
+    return joined
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Visión en pág. 2 (N/S/E/O por verde→rosa)
+# OpenCV helpers y constantes seguras (evita crash si falta OTSU en build)
+# ──────────────────────────────────────────────────────────────────────────────
+def cv_flag(name: str, default: int = 0) -> int:
+    return int(getattr(cv2, name, default))
+
+THRESH_BINARY     = cv_flag("THRESH_BINARY", 0)
+THRESH_BINARY_INV = cv_flag("THRESH_BINARY_INV", 0)
+THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visión por computador (página 2): filas + N/S/E/O
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
-    dpi = 360 if FAST_MODE else 520
+    dpi = 400 if FAST_MODE else 550
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
     pil: Image.Image = pages[0].convert("RGB")
     return np.array(pil)[:, :, ::-1]  # RGB→BGR
 
-def crop_map(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
-    """Recorte general para la zona de listados con mini-mapas."""
+def crop_map_band(bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int]]:
+    """Recorta banda donde viven croquis y columnas (salta cabecera/pie)."""
     h, w = bgr.shape[:2]
-    top = int(h * 0.12); bottom = int(h * 0.96)
-    left = int(w * 0.06); right = int(w * 0.92)
-    top = max(0, top); bottom = min(h, bottom)
-    left = max(0, left); right = min(w, right)
-    if bottom - top < 100 or right - left < 100:
-        return bgr, (0, 0)
+    top = int(h * 0.16); bottom = int(h * 0.96)
+    left = int(w * 0.05); right = int(w * 0.95)
     return bgr[top:bottom, left:right], (left, top)
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Verde agua (parcela propia)
+    # Verde de parcela propia
     g_ranges = [
-        (np.array([35,  20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
-        (np.array([86,  15, 50], np.uint8), np.array([100,255,255], np.uint8)),
+        (np.array([35,  20, 40], np.uint8), np.array([85, 255, 255], np.uint8)),
+        (np.array([86,  15, 40], np.uint8), np.array([100,255, 255], np.uint8)),
     ]
-    # Rosa (vecinos)
+    # Rosa de vecino
     p_ranges = [
-        (np.array([160, 20, 80], np.uint8), np.array([179,255,255], np.uint8)),
-        (np.array([  0, 20, 80], np.uint8), np.array([ 10,255,255], np.uint8)),
+        (np.array([160, 20, 70], np.uint8), np.array([179,255,255], np.uint8)),
+        (np.array([  0, 20, 70], np.uint8), np.array([ 10,255,255], np.uint8)),
     ]
     mg = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     mp = np.zeros(hsv.shape[:2], np.uint8)
+    for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     for lo, hi in p_ranges: mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
     k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
     mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3); mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
     mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
     return mg, mp
 
-def contours_centroids(mask: np.ndarray, min_area: int = 220) -> List[Tuple[int,int,int]]:
+def contours_centroids(mask: np.ndarray, min_area: int = 200) -> List[Tuple[int,int,int]]:
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in cnts:
@@ -175,155 +153,230 @@ def contours_centroids(mask: np.ndarray, min_area: int = 220) -> List[Tuple[int,
         if a < min_area: continue
         M = cv2.moments(c)
         if M["m00"] == 0: continue
-        cx = int(M["m10"] / M["m00"]) ; cy = int(M["m01"] / M["m00"]) ;
+        cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
         out.append((cx, cy, int(a)))
-    out.sort(key=lambda x: x[1])  # Y ascendente (fila arriba→abajo)
+    out.sort(key=lambda t: t[1])  # de arriba a abajo
     return out
 
 def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
-    ang = math.degrees(math.atan2(-(sy), sx))  # Norte arriba
+    ang = math.degrees(math.atan2(-(sy), sx))  # norte=arriba
     if -45 <= ang <= 45: return "este"
     if 45 < ang <= 135:  return "norte"
     if -135 <= ang < -45:return "sur"
     return "oeste"
 
-def detect_rows_and_sides(bgr: np.ndarray) -> List[dict]:
-    crop, (ox, oy) = crop_map(bgr)
-    mg, mp = color_masks(crop)
-
-    greens = contours_centroids(mg, min_area=(380 if FAST_MODE else 260))
-    pinks  = contours_centroids(mp, min_area=(260 if FAST_MODE else 180))
+def detect_rows_with_sides(bgr: np.ndarray) -> List[dict]:
+    """
+    Devuelve lista de filas (ordenadas de arriba a abajo):
+    { main:(x,y), neigh:(x,y)|None, side:'norte'|'sur'|'este'|'oeste'|'' }
+    """
+    band, (ox, oy) = crop_map_band(bgr)
+    mg, mp = color_masks(band)
+    greens = contours_centroids(mg, min_area=(260 if FAST_MODE else 200))
+    pinks  = contours_centroids(mp, min_area=(220 if FAST_MODE else 180))
 
     rows: List[dict] = []
-    if not greens:
-        return rows
+    used = set()
 
-    for gi, (gx, gy, _ga) in enumerate(greens):
-        g_abs = (gx + ox, gy + oy)
-        # rosa más cercano
-        best = None
-        bestd = 1e9
-        for (px, py, _pa) in pinks:
-            d = (px-gx)**2 + (py-gy)**2
+    for gx, gy, _ in greens:
+        gabs = (gx+ox, gy+oy)
+        # vecino rosa más cercano por distancia vertical
+        best = None; bestd = 1e9; idx = -1
+        for i, (px, py, _a) in enumerate(pinks):
+            if i in used: continue
+            d = abs(py - gy) + 0.3*abs(px - gx)
             if d < bestd:
-                bestd = d; best = (px + ox, py + oy)
+                bestd = d; best = (px+ox, py+oy); idx = i
         side = ""
         if best is not None:
-            side = side_of(g_abs, best)
-        rows.append({
-            "row_index": gi,
-            "main_center": g_abs,
-            "neigh_center": best,
-            "side": side
-        })
+            side = side_of(gabs, best)
+            used.add(idx)
+        rows.append({"main": gabs, "neigh": best, "side": side})
+
+    # si hay más rosas sueltas, añádelas como filas huérfanas (raro)
+    for i, (px, py, _a) in enumerate(pinks):
+        if i in used: continue
+        rows.append({"main": None, "neigh": (px+ox, py+oy), "side": ""})
+
+    rows.sort(key=lambda r: (r["main"][1] if r["main"] else r["neigh"][1]))
     return rows
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Vista previa con etiquetas (N/S/E/O y opcionalmente nombres)
+# Extracción por COLUMNA (debajo de “Apellidos Nombre / Razón social”)
 # ──────────────────────────────────────────────────────────────────────────────
-def draw_preview(bgr: np.ndarray, rows: List[dict], owners_rows: Optional[List[dict]], labels: bool, names: bool) -> np.ndarray:
-    vis = bgr.copy()
-    for r in rows:
-        mc = r.get("main_center")
-        nc = r.get("neigh_center")
-        sd = r.get("side") or ""
-        if mc:
-            cv2.circle(vis, mc, 10, (0,255,0), -1)   # verde principal
-        if nc:
-            cv2.circle(vis, nc, 8, (0,0,255), -1)    # vecino rosa
-            cv2.line(vis, mc, nc, (255,255,255), 2)
-            if labels:
-                label = {"norte":"N","sur":"S","este":"E","oeste":"O"}.get(sd, "?")
-                cv2.putText(vis, label, (nc[0]+10, nc[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-                if names and owners_rows:
-                    yref = int((mc[1] + nc[1]) / 2) if mc and nc else (nc[1] if nc else mc[1])
-                    name = pick_owner_for_y(owners_rows, yref)
-                    if name:
-                        cv2.putText(vis, name, (nc[0]+26, nc[1]+18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2, cv2.LINE_AA)
-    return vis
+def owner_from_column(page: pdfplumber.page.Page,
+                      center_y_pdf: float,
+                      window_pdf: float,
+                      left_ratio: float = 0.34,
+                      right_ratio: float = 0.96) -> str:
+    """
+    Recorta una franja horizontal alrededor de center_y_pdf en la columna derecha
+    y extrae el titular justo debajo del encabezado “APELLIDOS NOMBRE / …”.
+    """
+    W, H = page.width, page.height
+    y0 = max(0, center_y_pdf - window_pdf)
+    y1 = min(H, center_y_pdf + window_pdf)
+    x0 = W * left_ratio
+    x1 = W * right_ratio
+
+    crop = page.crop((x0, y0, x1, y1))
+    text = crop.extract_text(x_tolerance=1.5, y_tolerance=1.5) or ""
+    lines = normalize_text(text).split("\n")
+    if not lines:
+        return ""
+
+    # 1) Localiza cabecera “APELLIDOS NOMBRE …”
+    hdr_idx = None
+    for i, ln in enumerate(lines):
+        U = ln.upper()
+        if "APELLIDOS NOMBRE" in U and ("RAZON" in U or "RAZÓN" in U):
+            hdr_idx = i
+            break
+
+    start = (hdr_idx + 1) if hdr_idx is not None else 0
+    # 2) Toma 1–2 líneas válidas en mayúsculas (sin números) como “owner”
+    picked: List[str] = []
+    steps = 0
+    for j in range(start, min(len(lines), start + 8)):
+        cand = lines[j].strip()
+        U = cand.upper()
+        if not cand:
+            if picked: break
+            continue
+        if "NIF" in U or "DOMICILIO" in U:
+            break
+        if is_upper_name(cand):
+            picked.append(U)
+            if len(picked) >= 2:
+                break
+        steps += 1
+
+    owner = reconstruct_owner(picked) if picked else ""
+    return owner
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OCR auxiliar para números de parcela (si hiciera falta en el futuro)
+# ──────────────────────────────────────────────────────────────────────────────
+def ocr_digits(img: np.ndarray, psm: int = 7) -> str:
+    cfg = f"--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789"
+    data = pytesseract.image_to_string(img, config=cfg) or ""
+    digits = re.sub(r"\D+", "", data)
+    return digits
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"ok": True, "version": app.version, "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY}
+    return {
+        "ok": True, "version": app.version,
+        "FAST_MODE": FAST_MODE, "TEXT_ONLY": TEXT_ONLY,
+        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
+    }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
-def preview_get(
-    pdf_url: AnyHttpUrl = Query(...),
-    labels: bool = Query(True),   # ← por defecto PINTA N/S/E/O
-    names: bool = Query(False),   # ← añade nombres si se pide
-):
+def preview_get(pdf_url: AnyHttpUrl = Query(...), labels: int = Query(0)):
+    """
+    labels=0 → solo puntos; 1 → N/S/E/O; 2 → N/S/E/O + owner abreviado (si hay)
+    """
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
+    bgr = page2_bgr(pdf_bytes)
+    rows = detect_rows_with_sides(bgr)
+
+    owners_by_row: Dict[int, str] = {}
     try:
-        bgr = page2_bgr(pdf_bytes)
-        rows = detect_rows_and_sides(bgr)
-        owners_rows = owners_by_column_page2(pdf_bytes) if names else None
-        vis = draw_preview(bgr, rows, owners_rows, labels=labels, names=names)
-        ok, png = cv2.imencode(".png", vis)
-        if not ok:
-            raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
-        return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
-    except Exception as e:
-        err = str(e)
-        blank = np.zeros((240, 640, 3), np.uint8)
-        cv2.putText(blank, f"ERR: {err[:60]}", (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        ok, png = cv2.imencode(".png", blank)
-        return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page = pdf.pages[1]  # pág.2 (index 1)
+            Himg = bgr.shape[0]
+            Hpdf = page.height
+            band = Hpdf * 0.06  # ventana vertical ≈ 6% de la página
+
+            for idx, r in enumerate(rows):
+                cy_img = (r["main"][1] if r["main"] else (r["neigh"][1] if r["neigh"] else None))
+                if cy_img is None: 
+                    owners_by_row[idx] = ""
+                    continue
+                cy_pdf = (cy_img / Himg) * Hpdf
+                owner = owner_from_column(page, cy_pdf, band)
+                owners_by_row[idx] = owner
+    except Exception:
+        owners_by_row = {}
+
+    vis = bgr.copy()
+    for i, r in enumerate(rows):
+        if r["main"]:
+            cv2.circle(vis, r["main"], 12, (0,255,0), -1)
+        if r["neigh"]:
+            cv2.circle(vis, r["neigh"], 10, (0,0,255), -1)
+            if labels >= 1 and r["side"]:
+                label = {"norte":"N","sur":"S","este":"E","oeste":"O"}[r["side"]]
+                cv2.putText(vis, label, (r["neigh"][0]+6, r["neigh"][1]-8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 3, cv2.LINE_AA)
+            if labels >= 2:
+                short = (owners_by_row.get(i) or "")[:18]
+                if short:
+                    cv2.putText(vis, short, (r["neigh"][0]+6, r["neigh"][1]+18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+
+    ok, png = cv2.imencode(".png", vis)
+    if not ok:
+        raise HTTPException(status_code=500, detail="No se pudo codificar la vista previa.")
+    return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
 @app.post("/preview", dependencies=[Depends(check_token)])
-def preview_post(data: ExtractIn = Body(...), labels: bool = Query(True), names: bool = Query(False)):
-    return preview_get(pdf_url=data.pdf_url, labels=labels, names=names)
+def preview_post(data: ExtractIn = Body(...), labels: int = Query(0)):
+    return preview_get(pdf_url=data.pdf_url, labels=labels)
 
 @app.post("/extract", response_model=ExtractOut, dependencies=[Depends(check_token)])
 def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
-
-    # (1) Titulares por columna en pág. 2
-    owners_rows = owners_by_column_page2(pdf_bytes)
-    owners_detected = [o["name"] for o in owners_rows if o.get("name")]
-    owners_detected = list(dict.fromkeys(owners_detected))[:8]
-
     if TEXT_ONLY:
-        note = "Modo TEXT_ONLY activo: visión desactivada."
-        dbg = {"owners_rows": owners_rows[:6]} if debug else None
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = normalize_text(pdf.pages[1].extract_text() or "")
+        owners_detected = []
+        for line in text.split("\n"):
+            if is_upper_name(line):
+                owners_detected.append(line.strip().upper())
+        owners_detected = list(dict.fromkeys(owners_detected))[:8]
         return ExtractOut(linderos={"norte":"","sur":"","este":"","oeste":""},
-                          owners_detected=owners_detected, note=note, debug=dbg)
+                          owners_detected=owners_detected,
+                          note="Modo TEXT_ONLY activo.",
+                          debug={"TEXT_ONLY": True} if debug else None)
 
-    # (2) Visión en pág. 2 → lados
+    # 1) Detectar filas y lados en la imagen
+    bgr = page2_bgr(pdf_bytes)
+    rows = detect_rows_with_sides(bgr)
+
+    # 2) Extraer por COLUMNA el titular para cada fila
+    owners_by_row: Dict[int, str] = {}
     try:
-        bgr = page2_bgr(pdf_bytes)
-        rows = detect_rows_and_sides(bgr)
-
-        linderos = {"norte":"","sur":"","este":"","oeste":""}
-        for r in rows:
-            mc = r.get("main_center"); nc = r.get("neigh_center")
-            sd = r.get("side") or ""
-            if not sd:
-                continue
-            yref = None
-            if mc and nc: yref = int((mc[1] + nc[1]) / 2)
-            elif nc:      yref = nc[1]
-            elif mc:      yref = mc[1]
-            if yref is None:
-                continue
-            owner = pick_owner_for_y(owners_rows, yref)
-            if owner and not linderos[sd]:
-                linderos[sd] = owner
-
-        note = None if any(linderos.values()) else "No se pudo determinar lado/vecino con suficiente confianza."
-        dbg  = {"rows": rows, "owners_rows": owners_rows[:6]} if debug else None
-        return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
-
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page = pdf.pages[1]
+            Himg = bgr.shape[0]
+            Hpdf = page.height
+            band = Hpdf * 0.06  # ventana ≈ 6% de la altura
+            for idx, r in enumerate(rows):
+                cy_img = (r["main"][1] if r["main"] else (r["neigh"][1] if r["neigh"] else None))
+                if cy_img is None:
+                    owners_by_row[idx] = ""
+                    continue
+                cy_pdf = (cy_img / Himg) * Hpdf
+                owners_by_row[idx] = owner_from_column(page, cy_pdf, band)
     except Exception as e:
-        note = f"Excepción visión: {e}"
-        dbg = {"exception": str(e)} if debug else None
-        return ExtractOut(linderos={"norte":"","sur":"","este":"","oeste":""},
-                          owners_detected=owners_detected, note=note, debug=dbg)
+        owners_by_row = {}
+
+    # 3) Armar linderos (lado -> titular) a partir de filas
+    linderos = {"norte":"","sur":"","este":"","oeste":""}
+    for idx, r in enumerate(rows):
+        sd = r.get("side") or ""
+        if not sd or linderos.get(sd): 
+            continue
+        owner = owners_by_row.get(idx, "")
+        if
+
 
 
 
