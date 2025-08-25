@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.6")
+app = FastAPI(title="AutoCatastro AI", version="0.4.7")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -47,6 +47,15 @@ BAD_TOKENS = {
     "SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA",
     "CATASTRAL","TITULARIDAD","PRINCIPAL"
 }
+
+# geotokens / ruido que no deben entrar en el nombre
+GEO_TOKENS = {
+    "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
+    "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
+    "GALICIA","[LUGO]","[BARCELONA]"
+}
+
+NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -145,41 +154,66 @@ def ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
     txt = re.sub(r"\n{2,}", "\n", txt)
     return txt.strip()
 
+# — Limpiar posibles colas de geografía / basura —
+def clean_owner_line(line: str) -> str:
+    if not line: return ""
+    toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", line.upper()) if t]
+    out = []
+    for t in toks:
+        if any(ch.isdigit() for ch in t): break
+        if t in GEO_TOKENS or "[" in t or "]" in t: break
+        if t in BAD_TOKENS: continue
+        out.append(t)
+        # parar si ya tenemos 4–5 tokens útiles
+        if len([x for x in out if x not in NAME_CONNECTORS]) >= 4:
+            break
+    # compactar conectores múltiples
+    compact = []
+    for t in out:
+        if (not compact) and t in NAME_CONNECTORS:
+            continue
+        compact.append(t)
+    name = " ".join(compact).strip()
+    # poda final por longitud
+    return name[:48]
+
 def pick_owner_from_text(txt: str) -> str:
     if not txt: return ""
     lines = [l.strip() for l in txt.split("\n") if l.strip()]
-    idxs = []
-    for i, l in enumerate(lines):
+    # primera línea válida
+    for l in lines:
         U = l.upper()
-        if sum(ch.isdigit() for ch in U) > 1: continue
-        if any(tok in U for tok in BAD_TOKENS): continue
-        if not UPPER_NAME_RE.match(U): continue
-        if 5 <= len(U) <= 40: idxs.append(i)
-    if not idxs: return ""
-    i0 = idxs[0]
-    cand = lines[i0].upper()
-    # concatenar segunda línea si cabe (JOSE + LUIS)
-    if i0 + 1 < len(lines):
-        nxt = lines[i0+1].strip().upper()
-        if (UPPER_NAME_RE.match(nxt)
-            and not any(tok in nxt for tok in BAD_TOKENS)
-            and sum(ch.isdigit() for ch in nxt) <= 1
-            and len(cand) + 1 + len(nxt) <= 42):
-            cand = f"{cand} {nxt}"
-    return cand
+        if any(tok in U for tok in BAD_TOKENS): 
+            continue
+        if sum(ch.isdigit() for ch in U) > 1:
+            continue
+        if not UPPER_NAME_RE.match(U):
+            continue
+        name = clean_owner_line(U)
+        if len(name) >= 8:
+            return name
+    return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar columna “Apellidos…” y extraer el titular por fila
+# Localizar columna “Apellidos…” y extraer SOLO la primera línea del titular
 # ──────────────────────────────────────────────────────────────────────────────
-def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int) -> Tuple[int,int,int]:
+def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
+                               x_text0: int, x_text1: int) -> Tuple[int,int,int,int]:
+    """
+    Devuelve (x0, x1, y0, y1) para la banda del NOMBRE del titular.
+    Se busca 'APELLIDOS' y se coloca y0 justo debajo. Alto: ~3.5% de la página.
+    """
     h, w = bgr.shape[:2]
-    pad_y = int(h * 0.05)
-    y0 = max(0, row_y - pad_y)
-    y1 = min(h, row_y + pad_y)
+    pad_y = int(h * 0.06)
+    y0s = max(0, row_y - pad_y)
+    y1s = min(h, row_y + pad_y)
 
-    band = bgr[y0:y1, x_text0:x_text1]
+    band = bgr[y0s:y1s, x_text0:x_text1]
     if band.size == 0:
-        return x_text0, int(x_text0 + 0.55*(x_text1-x_text0)), y0 + (y1-y0)//2
+        # fallback conservador
+        y0 = max(0, row_y - int(h*0.01))
+        y1 = min(h, y0 + int(h*0.035))
+        return x_text0, int(x_text0 + 0.55*(x_text1-x_text0)), y0, y1
 
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = binarize(gray)
@@ -193,56 +227,53 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
         hs = data.get("height", [])
 
         x_nif = None
-        y_bottom_header = None
-        saw_apellidos = False
+        header_bottom = None
+        saw_ap = False
 
         for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
             if not t: continue
             T = t.upper()
             if "APELLIDOS" in T:
-                saw_apellidos = True
-                y_bottom_header = max(y_bottom_header or 0, ty + hh)
+                saw_ap = True
+                header_bottom = max(header_bottom or 0, ty + hh)
             if T == "NIF":
                 x_nif = lx
-                y_bottom_header = max(y_bottom_header or 0, ty + hh)
+                header_bottom = max(header_bottom or 0, ty + hh)
 
-        if x_nif is not None:
-            x_left  = x_text0
-            x_right = min(x_text1, x_text0 + x_nif - 8)
-            y_base  = y0 + (y_bottom_header or 0)
-            if x_right - x_left > (x_text1 - x_text0) * 0.22:
-                return x_left, x_right, y_base
+        if header_bottom is not None:
+            # coordenadas absolutas
+            y0 = y0s + header_bottom + 6
+            y1 = min(h, y0 + int(h * 0.035))  # sólo una línea aprox
+            if x_nif is not None:
+                x0 = x_text0
+                x1 = min(x_text1, x_text0 + x_nif - 8)
+            else:
+                x0 = x_text0
+                x1 = int(x_text0 + 0.55*(x_text1-x_text0))
+            if x1 - x0 > (x_text1 - x_text0) * 0.22:
+                return x0, x1, y0, y1
 
-    x_left  = x_text0
-    x_right = int(x_text0 + 0.55*(x_text1-x_text0))
-    y_base  = y0 + (y1-y0)//2
-    return x_left, x_right, y_base
+    # fallback
+    y0 = max(0, row_y - int(h*0.01))
+    y1 = min(h, y0 + int(h*0.035))
+    x0 = x_text0
+    x1 = int(x_text0 + 0.55*(x_text1-x_text0))
+    return x0, x1, y0, y1
 
 def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,int,int,int], int]:
     """
     Devuelve (owner, (x0,y0,x1,y1), attempt_used)
-    Hace hasta 3 intentos, expandiendo a la izquierda si el texto sale “corto”.
+    Hace hasta 3 intentos, expandiendo a la izquierda si el texto sale “mordido”.
     """
     h, w = bgr.shape[:2]
-    x_text0 = int(w * 0.36)  # más a la izquierda
+    x_text0 = int(w * 0.33)  # más a la izquierda para no perder primeras letras
     x_text1 = int(w * 0.96)
 
-    x_col0, x_col1, y_header = find_header_columns(bgr, row_y, x_text0, x_text1)
-
-    base_pad_left  = max(24, int(w * 0.045))
-    base_pad_right = max(8,  int(w * 0.008))
-
-    # altura de la celda
-    y0_base = max(0, y_header + 6)
-    y1_base = min(h, row_y + int(h * (0.10 if FAST_MODE else 0.12)))
-
-    WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
     attempts = []
     for attempt in range(3):
         extra_left = attempt * max(18, int(w * 0.03))
-        x0 = max(0, x_col0 - base_pad_left - extra_left)
-        x1 = min(w, x_col1 + base_pad_right)
-        y0, y1 = y0_base, y1_base
+        x0_base = max(0, x_text0 - extra_left)
+        x0, x1, y0, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
 
         roi = bgr[y0:y1, x0:x1]
         if roi.size == 0:
@@ -254,6 +285,7 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
         g = enhance_gray(g)
         bw, bwi = binarize(g)
 
+        WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
         variants = [
             ocr_text(bw,  psm=6,  whitelist=WL),
             ocr_text(bwi, psm=6,  whitelist=WL),
@@ -268,13 +300,9 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, Tuple[int,
                 break
 
         attempts.append((attempt, x0,y0,x1,y1, owner))
-        # si el nombre parece “mordido” (muy corto o 1 palabra corta), expandimos más
-        if owner:
-            parts = [p for p in owner.split() if p]
-            if len(owner) >= 10 and (len(parts) >= 2 or len(owner) >= 14):
-                return owner, (x0,y0,x1,y1), attempt
+        if owner and len(owner) >= 10:
+            return owner, (x0,y0,x1,y1), attempt
 
-    # si ninguno “canta”, devolvemos el mejor (más largo)
     best = max(attempts, key=lambda t: len(t[5]) if t[5] else 0)
     return best[5], (best[1],best[2],best[3],best[4]), best[0]
 
@@ -287,7 +315,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # banda de croquis
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
@@ -344,7 +371,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "side": side,
             "owner": owner,
             "roi_attempt": attempt_id,
-            "x_col0": x0, "x_col1": x1
+            "roi": [x0,y0,x1,y1]
         })
 
     dbg = {"rows": rows_dbg}
@@ -426,4 +453,5 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
