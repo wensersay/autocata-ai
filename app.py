@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.3")
+app = FastAPI(title="AutoCatastro AI", version="0.4.4")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -142,9 +142,14 @@ def binarize(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return bw, bwi
 
 def ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
+    """
+    Usa psm indicado y, si hay whitelist, la pasa ENTRE COMILLAS DOBLES
+    para no romper el parser de Tesseract (evita 'No closing quotation').
+    """
     cfg = f"--psm {psm} --oem 3"
-    if whitelist:
-        cfg += f" -c tessedit_char_whitelist={whitelist}"
+    if whitelist is not None:
+        safe = (whitelist or "").replace('"', '')  # evitar dobles comillas en el valor
+        cfg += f' -c tessedit_char_whitelist="{safe}"'
     txt = pytesseract.image_to_string(img, config=cfg) or ""
     txt = txt.replace("\r", "\n")
     txt = re.sub(r"[ \t]+", " ", txt)
@@ -154,7 +159,7 @@ def ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
 def pick_owner_from_text(txt: str) -> str:
     """
     Selecciona la 1ª línea razonable (mayúsculas, sin números, 6..34 caracteres),
-    y si la siguiente línea también es parte del nombre (p.ej. «JOSE\nLUIS»),
+    y si la siguiente línea también es parte del nombre (p.ej. «JOSE» + «LUIS»),
     la concatena.
     """
     if not txt: return ""
@@ -180,7 +185,7 @@ def pick_owner_from_text(txt: str) -> str:
             and not any(tok in nxt for tok in BAD_TOKENS)
             and sum(ch.isdigit() for ch in nxt) <= 1
             and len(cand) + 1 + len(nxt) <= 36):
-            cand = f"{cand} {nxt}"
+                cand = f"{cand} {nxt}"
     return cand
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,7 +199,6 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
     Si no se detecta, usa heurística por defecto.
     """
     h, w = bgr.shape[:2]
-    # Franja horizontal de texto
     pad_y = int(h * 0.04)
     y0 = max(0, row_y - pad_y)
     y1 = min(h, row_y + pad_y)
@@ -206,7 +210,6 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = binarize(gray)
 
-    # OCR por palabras para ubicar “APELLIDOS” y “NIF”
     for im in (bw, bwi):
         data = pytesseract.image_to_data(
             im, output_type=pytesseract.Output.DICT,
@@ -229,18 +232,16 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
                 saw_apellidos = True
                 y_bottom_header = max(y_bottom_header or 0, ty + hh)
             if T == "NIF":
-                x_nif = lx  # en coords de 'band'
+                x_nif = lx
                 y_bottom_header = max(y_bottom_header or 0, ty + hh)
 
         if x_nif is not None and (saw_apellidos or y_bottom_header is not None):
             x_left  = x_text0
-            x_right = min(x_text1, x_text0 + x_nif - 8)  # antes de NIF
+            x_right = min(x_text1, x_text0 + x_nif - 8)
             y_base  = y0 + (y_bottom_header or 0)
-            # Sanidad de límites
             if x_right - x_left > (x_text1 - x_text0) * 0.25:
                 return x_left, x_right, y_base
 
-    # Fallback heurístico
     x_left  = x_text0
     x_right = int(x_text0 + 0.55*(x_text1-x_text0))
     y_base  = y0 + (y1-y0)//2
@@ -249,19 +250,16 @@ def find_header_columns(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int)
 def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> str:
     """
     Dado el Y central de la fila, recorta la celda «Apellidos Nombre / Razón social»
-    usando la cabecera como referencia y hace OCR restringido a mayúsculas.
+    usando la cabecera como referencia y hace OCR restringido.
     """
     h, w = bgr.shape[:2]
-    # Bloque de texto (columna derecha global)
     x_text0 = int(w * 0.40)
     x_text1 = int(w * 0.96)
 
-    # Localizar límites exactos de la 1ª columna con la cabecera (APELLIDOS/NIF)
     x_col0, x_col1, y_header = find_header_columns(bgr, row_y, x_text0, x_text1)
 
-    # Recorte de contenido por debajo de la cabecera
     y0 = max(0, y_header + 6)
-    y1 = min(h, row_y + int(h * (0.06 if FAST_MODE else 0.08)))  # suficiente para una línea (o dos)
+    y1 = min(h, row_y + int(h * (0.06 if FAST_MODE else 0.08)))
     roi = bgr[y0:y1, x_col0:x_col1]
     if roi.size == 0:
         return ""
@@ -270,7 +268,6 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> str:
     g = cv2.resize(g, None, fx=1.25, fy=1.25, interpolation=cv2.INTER_CUBIC)
     bw, bwi = binarize(g)
 
-    # PSM6 y whitelist de MAYÚSCULAS + espacio
     WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
     variants = [
         ocr_text(bw,  psm=6, whitelist=WL),
@@ -438,6 +435,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
 
