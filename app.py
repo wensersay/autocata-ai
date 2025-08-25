@@ -14,7 +14,7 @@ from collections import defaultdict
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.6")
+app = FastAPI(title="AutoCatastro AI", version="0.4.7")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -50,8 +50,19 @@ STOP_IN_NAME = (
     "POLÍGONO","POLIGONO","PARCELA","[","]","(",")",
     "COORDENADAS","ETRS","HUSO","ESCALA","TITULARIDAD",
     "VALOR CATASTRAL","LOCALIZACIÓN","LOCALIZACION",
-    "REFERENCIA CATASTRAL","NIF","DOMICILIO","PL:","PT:"
+    "REFERENCIA CATASTRAL","NIF","DOMICILIO","PL:","PT:","ES:"
 )
+
+ADDRESS_TOKENS = (
+    " CL ", " CALLE", " C/"," AV ", " AV.", " AVDA", " AVENIDA",
+    " LG ", " LUGAR", " BLOQUE", " PORTAL", " ESCALERA", " PISO", " PTA",
+    " MONFORTE", " LUGO", " BARCELONA", " MADRID", " VALENCIA", " CORUÑA",
+    " CP ", " POSTAL", " KM ", " POLÍGONO ", " POLIGONO "
+)
+
+def is_addressy(u: str) -> bool:
+    U = f" {u.upper()} "
+    return any(tok in U for tok in ADDRESS_TOKENS)
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -84,18 +95,13 @@ def is_upper_name(line: str) -> bool:
     return bool(UPPER_NAME_RE.match(line))
 
 def clean_name_line(s: str) -> str:
-    # Quita marcas de provincia/municipio y paréntesis
+    # Quita corchetes/paréntesis y DNI
     s = s.strip()
     s = re.sub(r"\[[^\]]*\]", "", s)
     s = re.sub(r"\([^)]*\)", "", s)
-
-    # Elimina DNIs completos
     s = DNI_RE.sub("", s)
 
-    # Separa en tokens para filtrar abreviaturas
     toks = [t for t in re.split(r"\s+", s) if t]
-
-    # Quita números y abreviaturas demasiado cortas salvo conectores comunes
     keep_short = {"DE","LA","DEL","LOS","LAS","DA","DO","EL","Y"}
     cleaned = []
     for t in toks:
@@ -110,9 +116,7 @@ def clean_name_line(s: str) -> str:
 
     s = " ".join(cleaned)
     s = re.sub(r"\s{2,}", " ", s).strip()
-
-    # Corta a 26 chars (regla empírica)
-    if len(s) > 26:
+    if len(s) > 26:  # regla empírica
         s = s[:26].rstrip()
     return s
 
@@ -123,13 +127,12 @@ def merge_second_token_if_short(first: str, second: str) -> str:
             return (first + " " + t).strip()
     return first
 
-# Respaldo (solo texto) por si lo quieres usar en TEXT_ONLY
+# Respaldo solo texto (no usado en flujo principal)
 def extract_owners_map_text(pdf_bytes: bytes) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pi, page in enumerate(pdf.pages):
-            if pi == 0:
-                continue
+            if pi == 0: continue
             text = normalize_text(page.extract_text(x_tolerance=2, y_tolerance=2) or "")
             lines = text.split("\n")
             curr_parcel: Optional[str] = None
@@ -139,33 +142,26 @@ def extract_owners_map_text(pdf_bytes: bytes) -> Dict[str, str]:
                 up  = raw.upper()
                 if "PARCELA" in up:
                     tokens = [t for t in up.replace(",", " ").split() if t.isdigit()]
-                    if tokens:
-                        curr_parcel = tokens[-1]
+                    if tokens: curr_parcel = tokens[-1]
                 if ("APELLIDOS NOMBRE" in up and "RAZON" in up) or ("TITULARIDAD PRINCIPAL" in up) or ("PARCELA" in up):
                     j = i + 1
-                    cand1 = ""
-                    cand2 = ""
-                    steps = 0
+                    cand1 = ""; cand2 = ""; steps = 0
                     while j < len(lines) and steps < 12 and (not cand1 or not cand2):
-                        s = lines[j].strip()
-                        U = s.upper()
-                        if any(k in U for k in ("APELLIDOS NOMBRE","RAZON SOCIAL","NIF","DOMICILIO","REFERENCIA CATASTRAL")):
+                        rawU = lines[j].upper().strip()
+                        if any(k in rawU for k in ("APELLIDOS NOMBRE","RAZON SOCIAL","NIF","DOMICILIO","REFERENCIA CATASTRAL")):
                             j += 1; steps += 1; continue
-                        s_clean = clean_name_line(U)
-                        if s_clean and is_upper_name(s_clean):
-                            if not cand1:
-                                cand1 = s_clean
-                            elif not cand2:
-                                cand2 = s_clean
+                        # partir por DNI si existe
+                        m = DNI_RE.search(rawU)
+                        left = rawU[:m.start()].strip() if m else rawU
+                        s_clean = clean_name_line(left)
+                        if s_clean and is_upper_name(s_clean) and not is_addressy(s_clean):
+                            if not cand1: cand1 = s_clean
+                            elif not cand2: cand2 = s_clean
                         j += 1; steps += 1
-                    if curr_parcel and cand1:
-                        owner = cand1
-                        if cand2:
-                            owner = merge_second_token_if_short(owner, cand2)
-                        if curr_parcel not in mapping:
-                            mapping[curr_parcel] = owner
-                    i = j
-                    continue
+                    if curr_parcel and cand1 and curr_parcel not in mapping:
+                        owner = merge_second_token_if_short(cand1, cand2) if cand2 else cand1
+                        mapping[curr_parcel] = owner
+                    i = j; continue
                 i += 1
     return mapping
 
@@ -288,7 +284,6 @@ def prepare_page2_words(pdf_bytes: bytes):
 def cluster_lines(words: List[dict]) -> List[str]:
     if not words:
         return []
-    # Agrupa por 'top' (desde arriba, en puntos)
     rows = defaultdict(list)
     for w in words:
         key = int(round(w["top"]/2.0))*2  # bin suave
@@ -299,66 +294,77 @@ def cluster_lines(words: List[dict]) -> List[str]:
         out.append(" ".join([w["text"] for w in ws]))
     return out
 
+def pick_owner_from_lines(lines: List[str]) -> str:
+    # 1) preferir línea con DNI → usar parte izquierda del DNI
+    for i, raw in enumerate(lines):
+        U = raw.upper().strip()
+        m = DNI_RE.search(U)
+        if m:
+            left = U[:m.start()].strip()
+            left = clean_name_line(left)
+            if left and is_upper_name(left) and not is_addressy(left):
+                # posible segunda línea corta
+                nxt = clean_name_line(lines[i+1].upper()) if i+1 < len(lines) else ""
+                if nxt and not is_addressy(nxt):
+                    left = merge_second_token_if_short(left, nxt)
+                return left
+
+    # 2) si no hay DNI, primera mayúscula “limpia” que no sea dirección
+    for i, raw in enumerate(lines):
+        U = clean_name_line(raw.upper())
+        if U and is_upper_name(U) and not is_addressy(U):
+            nxt = clean_name_line(lines[i+1].upper()) if i+1 < len(lines) else ""
+            if nxt and not is_addressy(nxt):
+                U = merge_second_token_if_short(U, nxt)
+            return U
+    return ""
+
 def extract_owner_from_text_band(words_all: List[dict],
                                  page_w: float, page_h: float,
                                  img_w: int, img_h: int,
                                  band_px: Tuple[int,int],
                                  col_px: Tuple[int,int]) -> Tuple[str, dict]:
-    """Filtra palabras dentro de la banda (y) y columna (x) mapeando píxeles→puntos."""
+    """Filtra palabras dentro de la banda (y) y columna (x) mapeando píxeles→puntos.
+       Añadimos padding vertical para capturar ‘PARCELA…’ y la línea con el titular."""
     sx = img_w / float(page_w)
     sy = img_h / float(page_h)
 
-    x0_pt = col_px[0] / sx
-    x1_pt = col_px[1] / sx
-    y0_pt = band_px[0] / sy  # top-from-top
-    y1_pt = band_px[1] / sy  # bottom-from-top
+    # padding vertical relativo al alto de banda
+    y0_raw, y1_raw = band_px
+    band_h = max(1, y1_raw - y0_raw)
+    pad = max(80, min(220, int(band_h * 0.35)))
+    y0 = max(0, y0_raw - pad)
+    y1 = min(img_h, y1_raw + pad)
 
-    # Filtra palabras por caja
+    x0, x1 = col_px
+
+    x0_pt = x0 / sx; x1_pt = x1 / sx
+    y0_pt = y0 / sy; y1_pt = y1 / sy
+
     words = [w for w in words_all
              if (w["x0"] >= x0_pt and w["x1"] <= x1_pt and
                  w["top"] >= y0_pt and w["bottom"] <= y1_pt)]
 
     lines = cluster_lines(words)
-    debug = {"lines": lines[:8], "x0_pt": x0_pt, "x1_pt": x1_pt, "y0_pt": y0_pt, "y1_pt": y1_pt}
 
-    # Busca línea "PARCELA" y luego la 1ª línea con DNI o candidata a nombre
+    # ventana preferente: desde “PARCELA …” hacia abajo 10 líneas
     idx_par = -1
     for i, L in enumerate(lines):
         if "PARCELA" in L.upper():
-            idx_par = i
-            break
+            idx_par = i; break
+    if idx_par >= 0:
+        scan = lines[idx_par+1: idx_par+11]
+    else:
+        scan = lines[:14]
 
-    scan_range = range(idx_par+1, min(idx_par+10, len(lines))) if idx_par >= 0 else range(0, min(12, len(lines)))
-    owner1 = ""
-    owner2 = ""
-    # preferimos la que contenga DNI; si no, la primera MAYÚSCULA razonable
-    for j in scan_range:
-        rawU = lines[j].upper().strip()
-        if not rawU:
-            continue
-        has_dni = bool(DNI_RE.search(rawU))
-        cand = clean_name_line(rawU)
-        if not cand:
-            continue
-        if has_dni:
-            owner1 = cand
-            # mira si la siguiente es un token corto (tipo LUIS)
-            if j+1 < len(lines):
-                cand2 = clean_name_line(lines[j+1].upper())
-                if cand2:
-                    owner1 = merge_second_token_if_short(owner1, cand2)
-            break
-        if not owner1 and is_upper_name(cand):
-            owner1 = cand
-            # intenta fusionar siguiente corta
-            if j+1 < len(lines):
-                cand2 = clean_name_line(lines[j+1].upper())
-                if cand2:
-                    owner1 = merge_second_token_if_short(owner1, cand2)
-            # no rompemos por si aparece una con DNI un poco más abajo
-            owner2 = owner1
+    owner = pick_owner_from_lines(scan)
 
-    owner = owner1 or owner2 or ""
+    debug = {
+        "lines": lines[:18],
+        "scan_window": scan[:12],
+        "x0_pt": x0_pt, "x1_pt": x1_pt, "y0_pt": y0_pt, "y1_pt": y1_pt,
+        "pad_px": pad
+    }
     return owner, debug
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -368,19 +374,18 @@ def assign_linderos_with_rows_text(pdf_bytes: bytes, bgr: np.ndarray) -> Tuple[D
     vis = bgr.copy()
     rows = split_rows_and_centers(bgr)
 
-    # Columna derecha en píxeles (igual que en previas)
+    # Columna derecha (texto titularidad)
     h, w = bgr.shape[:2]
     col_x0 = int(w * 0.55)
     col_x1 = int(w * 0.97)
 
-    # Prepara texto de página 2 una sola vez
     pdf, page, words_all = prepare_page2_words(pdf_bytes)
     try:
         linderos = {"norte":"","sur":"","este":"","oeste":""}
         owners_rows = []
 
         for r in rows:
-            y0_abs, y1_abs = r["y_abs"]  # banda en píxeles (top..bottom)
+            y0_abs, y1_abs = r["y_abs"]
             owner, dbg_txt = extract_owner_from_text_band(
                 words_all, page.width, page.height, w, h,
                 (y0_abs, y1_abs), (col_x0, col_x1)
@@ -389,14 +394,15 @@ def assign_linderos_with_rows_text(pdf_bytes: bytes, bgr: np.ndarray) -> Tuple[D
                 linderos[r["side"]] = owner
 
             # Visual para depurar
-            cv2.rectangle(vis, (col_x0, y0_abs), (col_x1, y1_abs), (255,255,255), 2)
+            cv2.rectangle(vis, (col_x0, max(0,y0_abs-dbg_txt.get("pad_px",0))),
+                               (col_x1, min(h,y1_abs+dbg_txt.get("pad_px",0))), (255,255,255), 2)
             if r["main_center"]:
                 cv2.circle(vis, r["main_center"], 9, (0,255,0), -1)
             if r["neigh_center"]:
                 cv2.circle(vis, r["neigh_center"], 7, (0,0,255), -1)
             if r["side"]:
                 lab = r["side"][:1].upper()
-                cv2.putText(vis, lab, (col_x0+6, y0_abs+24), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+                cv2.putText(vis, lab, (col_x0+6, (y0_abs+y1_abs)//2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
 
             owners_rows.append({
                 "row_y": r["row_y"],
@@ -426,11 +432,10 @@ def health():
             "cv2_flags":{"OTSU": bool(THRESH_OTSU)}}
 
 @app.get("/preview", dependencies=[Depends(check_token)])
-def preview_get(pdf_url: AnyHttpUrl = Query(...), labels: bool = Query(False)):
+def preview_get(pdf_url: AnyHttpUrl = Query(...), labels: bool = Query(True)):
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     try:
         bgr = page2_bgr(pdf_bytes)
-        # Usamos solo visión para dibujar filas y lados + cajas columna
         linderos, dbg, vis = assign_linderos_with_rows_text(pdf_bytes, bgr)
 
         if labels:
@@ -458,14 +463,14 @@ def preview_get(pdf_url: AnyHttpUrl = Query(...), labels: bool = Query(False)):
     return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
 @app.post("/preview", dependencies=[Depends(check_token)])
-def preview_post(data: ExtractIn = Body(...), labels: bool = Query(False)):
+def preview_post(data: ExtractIn = Body(...), labels: bool = Query(True)):
     return preview_get(pdf_url=data.pdf_url, labels=labels)
 
 @app.post("/extract", response_model=ExtractOut, dependencies=[Depends(check_token)])
 def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = fetch_pdf_bytes(str(data.pdf_url))
 
-    # Respaldo solo texto si se quisiera activar
+    # Texto de respaldo (no imprescindible aquí)
     parcel2owner = extract_owners_map_text(pdf_bytes)
 
     if TEXT_ONLY:
@@ -475,7 +480,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         return ExtractOut(linderos={"norte":"","sur":"","oeste":"","este":""},
                           owners_detected=owners_detected, note=note, debug=dbg)
 
-    # Visión para lados + TEXTO (no OCR) para titular por banda/columna
     try:
         bgr = page2_bgr(pdf_bytes)
         linderos, vdbg, _vis = assign_linderos_with_rows_text(pdf_bytes, bgr)
