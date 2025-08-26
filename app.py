@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.1")
+app = FastAPI(title="AutoCatastro AI", version="0.6.2")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -22,7 +22,7 @@ FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
 
 # DPI ajustables
-FAST_DPI = int(os.getenv("FAST_DPI", "360"))     # ← 360 para acelerar
+FAST_DPI = int(os.getenv("FAST_DPI", "340"))     # ← bajado a 340 para acelerar
 SLOW_DPI = int(os.getenv("SLOW_DPI", "500"))
 
 # Forzar unir segunda línea del nombre (opcional)
@@ -274,8 +274,8 @@ def read_line_ocr(bgr: np.ndarray, roi: Tuple[int,int,int,int]) -> str:
 def merge_two_lines(t1_raw: str, t2_raw: str) -> Tuple[str, dict]:
     """
     Une línea 1 y posible línea 2.
-    Cambios v0.6.1:
-      • 1 solo token en L2: ACEPTA si 4–12 letras (antes 3–12) → evita “ECE”.
+    Reglas v0.6.1:
+      • 1 token en L2: ACEPTA si 4–12 letras (LUIS entra; ECE no).
       • 2 tokens: cada uno 3–12 letras, sin geo/addr/stop, total ≤26.
     """
     info = {"picked_from": "strict", "second_line_used": False, "second_line_reason": ""}
@@ -298,20 +298,16 @@ def merge_two_lines(t1_raw: str, t2_raw: str) -> Tuple[str, dict]:
     if not extra_raw:
         return base, info
 
-    # Tokenizar L2 y filtrar
     toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", extra_raw.upper()) if t]
-    # quitar dígitos y stops
     toks = [t for t in toks if not any(ch.isdigit() for ch in t)]
     toks = [t for t in toks if t not in ADDR_STOP and t not in GEO_TOKENS]
     toks = [t for t in toks if UPPER_NAME_RE.match(t)]
 
-    # 1 token: 4–12 letras (LUIS entra; ECE ya no)
     if len(toks) == 1 and 4 <= len(toks[0]) <= 12:
         name = (base + " " + toks[0]).strip()
         info.update({"second_line_used": True, "second_line_reason": "1tok_ok"})
         return name[:48], info
 
-    # 2 tokens: cada uno 3–12 letras y total ≤26
     if len(toks) == 2 and all(3 <= len(t) <= 12 for t in toks):
         cand = " ".join(toks)
         if len(cand) <= 26:
@@ -319,7 +315,6 @@ def merge_two_lines(t1_raw: str, t2_raw: str) -> Tuple[str, dict]:
             info.update({"second_line_used": True, "second_line_reason": "2tok_ok"})
             return name[:48], info
 
-    # Forzado (opcional por env)
     if PERMISSIVE_SECOND_LINE:
         forced = re.sub(r"[\[\]\:\d]", " ", extra_raw.upper())
         forced = re.sub(r"\s{2,}", " ", forced).strip()
@@ -493,5 +488,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
