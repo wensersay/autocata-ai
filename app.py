@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.8")
+app = FastAPI(title="AutoCatastro AI", version="0.4.9")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -48,23 +48,15 @@ BAD_TOKENS = {
     "CATASTRAL","TITULARIDAD","PRINCIPAL","DIRECCIÓN","DIRECCION","COORDENADAS"
 }
 
-# geotokens / ruido que no deben entrar en el nombre
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
     "GALICIA","[LUGO]","[BARCELONA]"
 }
 
-# abreviaturas de dirección que no deben entrar
 ADDR_TOKENS = {"CL","CALLE","AV","AVDA","AVE","LG","LUGAR","PT","PL","PZ","CARRILET","BLOQUE","ES","ESC","NUM","Nº","NO"}
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
-
-# nombres frecuentes para ayudar a decidir continuidad (no exhaustivo)
-COMMON_GIVEN = {
-    "JOSE","LUIS","MARIA","MANUEL","ANTONIO","JUAN","CARLOS","FRANCISCO","JAVIER",
-    "ANA","ROSA","ISABEL","MARTA","PABLO","MIGUEL","DAVID","PEDRO","TERESA","LUISA"
-}
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -182,47 +174,6 @@ def clean_owner_line(line: str) -> str:
     name = " ".join(compact).strip()
     return name[:48]
 
-def looks_like_name_piece(s: str) -> bool:
-    """Acepta piezas cortas tipo 'JOSE', 'LUIS', 'MARIA TERESA' y descarta dirección."""
-    if not s: return False
-    U = s.upper().strip()
-    if any(ch.isdigit() for ch in U): return False
-    if any(tok in U for tok in BAD_TOKENS): return False
-    if any(tok in U.split() for tok in ADDR_TOKENS): return False
-    if "[" in U or "]" in U: return False
-    if len(U) > 18: return False  # segunda línea suele ser corta (nombre/s)
-    # todas las palabras deben ser letras o conectores
-    words = [w for w in re.split(r"[^A-ZÁÉÍÓÚÜÑ']+", U) if w]
-    if not words: return False
-    # al menos una palabra típica de nombre propio ayuda mucho
-    if any(w in COMMON_GIVEN for w in words):
-        return True
-    # si no hay comunes, acepta 1–2 palabras razonables (≥3 chars)
-    if len(words) <= 2 and all(len(w) >= 3 for w in words):
-        return True
-    return False
-
-def join_lines_if_continuation(l1: str, l2: str) -> str:
-    """Une l2 si parece continuación (nombre propio) y no mete dirección/NIF."""
-    base = clean_owner_line(l1)
-    extra = clean_owner_line(l2)
-    if not base: return ""
-    if not extra: return base
-    # Evitar duplicados evidentes
-    if extra in base or base.endswith(" " + extra):
-        return base
-    # Caso claro: termina en JOSE y l2 = LUIS (u otro given)
-    last_token = base.split()[-1] if base else ""
-    if last_token == "JOSE" and ("LUIS" in extra.split() or extra == "LUIS"):
-        return (base + " " + "LUIS").strip()
-    # Regla general
-    if looks_like_name_piece(extra):
-        merged = (base + " " + extra).strip()
-        # longitud razonable total (nombres largos ok, pero evita ensuciar)
-        if len(merged) <= 40:
-            return merged
-    return base
-
 def pick_owner_from_text(txt: str) -> str:
     if not txt: return ""
     lines = [l.strip() for l in txt.split("\n") if l.strip()]
@@ -237,24 +188,16 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar cabecera y bandas de línea 1 y 2 del titular (columna)
+# Localizar cabecera y bandas (línea 1 + línea 2)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
                                 x_text0: int, x_text1: int) -> Tuple[Tuple[int,int,int,int], Tuple[int,int,int,int], int, Optional[int]]:
-    """
-    Devuelve:
-      roi1=(x0,y0,x1,y1) primera línea del titular,
-      roi2=(x0,y0,x1,y1) segunda línea justo debajo,
-      attempt_used (siempre 0 aquí; se deja por compatibilidad),
-      x_nif (si se detecta la columna NIF para cortar por la izquierda).
-    """
     h, w = bgr.shape[:2]
     pad_y = int(h * 0.06)
     y0s = max(0, row_y - pad_y)
     y1s = min(h, row_y + pad_y)
 
     band = bgr[y0s:y1s, x_text0:x_text1]
-    # Por defecto (fallback conservador)
     line_h = int(h * 0.035)
     if band.size == 0:
         y0 = max(0, row_y - int(h*0.01))
@@ -266,7 +209,6 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = binarize(gray)
 
-    header_left = None
     x_nif = None
     header_bottom = None
 
@@ -282,7 +224,6 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
             if not t: continue
             T = t.upper()
             if "APELLIDOS" in T:
-                header_left   = lx if header_left is None else min(header_left, lx)
                 header_bottom = max(header_bottom or 0, ty + hh)
             if T == "NIF":
                 x_nif = lx
@@ -292,19 +233,16 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
             break
 
     if header_bottom is None:
-        # fallback
         y0 = max(0, row_y - int(h*0.01))
         y1 = min(h, y0 + line_h)
         roi1 = (x_text0, y0, int(x_text0 + 0.55*(x_text1-x_text0)), y1)
         roi2 = (roi1[0], min(h, roi1[3]+2), roi1[2], min(h, roi1[3]+2+line_h))
         return roi1, roi2, 0, None
 
-    # Coordenadas absolutas
     y1_line1 = y0s + header_bottom + 6
     roi1_y0  = y1_line1
     roi1_y1  = min(h, roi1_y0 + line_h)
 
-    # ancho por la izquierda: desde inicio de texto hasta antes de NIF (si existe)
     if x_nif is not None:
         x0 = x_text0
         x1 = min(x_text1, x_text0 + x_nif - 8)
@@ -313,8 +251,6 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
         x1 = int(x_text0 + 0.55*(x_text1-x_text0))
 
     roi1 = (x0, roi1_y0, x1, roi1_y1)
-
-    # segunda línea pegada justo debajo de la 1ª
     gap = 2
     roi2_y0 = min(h, roi1_y1 + gap)
     roi2_y1 = min(h, roi2_y0 + line_h)
@@ -322,39 +258,45 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
 
     return roi1, roi2, 0, x_nif
 
-def read_owner_two_lines(bgr: np.ndarray, roi1: Tuple[int,int,int,int], roi2: Tuple[int,int,int,int]) -> Tuple[str, str]:
-    """Lee texto de roi1 y roi2, limpia y decide si unir la 2ª línea."""
-    def read_roi(roi: Tuple[int,int,int,int]) -> str:
+def read_owner_two_lines(bgr: np.ndarray, roi1: Tuple[int,int,int,int], roi2: Tuple[int,int,int,int]) -> Tuple[str, str, str]:
+    """Lee ROI1 (filtrado como nombre) y ROI2 SIN FILTRO, concatena ROI2 (máx 26 chars)."""
+    def read_roi_variants(roi: Tuple[int,int,int,int]) -> List[str]:
         x0,y0,x1,y1 = roi
         crop = bgr[y0:y1, x0:x1]
         if crop.size == 0:
-            return ""
+            return []
         g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
         g = enhance_gray(g)
         bw, bwi = binarize(g)
         WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-        variants = [
+        return [
             ocr_text(bw,  psm=6,  whitelist=WL),
             ocr_text(bwi, psm=6,  whitelist=WL),
             ocr_text(bw,  psm=7,  whitelist=WL),
             ocr_text(bwi, psm=7,  whitelist=WL),
             ocr_text(bw,  psm=13, whitelist=WL),
         ]
-        # nos quedamos con la primera que parezca nombre
-        for t in variants:
-            cand = pick_owner_from_text(t)
-            if cand:
-                return cand
-        # si ninguna pasa el filtro estricto, devuelve la más larga (para debug)
-        variants = [v.strip() for v in variants if v.strip()]
-        return max(variants, key=len) if variants else ""
 
-    t1 = read_roi(roi1)  # primera línea (apellidos nombre)
-    t2 = read_roi(roi2)  # segunda línea (posible "LUIS", etc.)
+    # Línea 1: elegir como nombre válido
+    v1 = read_roi_variants(roi1)
+    t1 = ""
+    for cand in v1:
+        t1 = pick_owner_from_text(cand)
+        if t1:
+            break
 
-    owner = join_lines_if_continuation(t1, t2)
-    return owner, t2
+    # Línea 2: SIN filtro, elegir la variante MÁS LARGA no vacía, normalizar espacios, cortar a 26
+    v2 = [s.strip() for s in read_roi_variants(roi2) if s and s.strip()]
+    t2_raw = ""
+    if v2:
+        t2_raw = max(v2, key=len)
+        t2_raw = re.sub(r"\s+", " ", t2_raw).strip()
+        t2_raw = t2_raw[:26]  # LÍMITE solicitado
+
+    # Concatena siempre si hay t2_raw
+    owner = (t1 + (" " + t2_raw if t2_raw else "")).strip() if t1 else t2_raw
+    return owner, t1, t2_raw
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline por filas (con lectura de dos líneas)
@@ -400,7 +342,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         x_text1 = int(w * 0.96)
 
         roi1, roi2, attempt_id, x_nif = find_header_and_owner_bands(bgr, mcy, x_text0, x_text1)
-        owner, txt2 = read_owner_two_lines(bgr, roi1, roi2)
+        owner, t1, t2_raw = read_owner_two_lines(bgr, roi1, roi2)
 
         if side and owner and side not in used_sides:
             linderos[side] = owner
@@ -430,9 +372,9 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
             "side": side,
-            "txt1": linderos.get(side,"") if owner and side in used_sides else "",
-            "txt2": txt2,
-            "owner": owner,
+            "txt1": t1,           # primera línea (filtrada como nombre)
+            "txt2_raw": t2_raw,   # segunda línea SIN filtro, ya recortada a 26
+            "owner": owner,       # concat incondicional
             "roi_attempt": attempt_id,
             "roi1": list(roi1),
             "roi2": list(roi2),
@@ -518,5 +460,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
