@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.0")
+app = FastAPI(title="AutoCatastro AI", version="0.6.1")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -21,11 +21,11 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
 
-# DPI ajustables (por si quieres afinar sin redeploy)
-FAST_DPI = int(os.getenv("FAST_DPI", "360"))     # ← bajado de 400 a 360
+# DPI ajustables
+FAST_DPI = int(os.getenv("FAST_DPI", "360"))     # ← 360 para acelerar
 SLOW_DPI = int(os.getenv("SLOW_DPI", "500"))
 
-# Forzar unir segunda línea del nombre (solo si lo necesitas)
+# Forzar unir segunda línea del nombre (opcional)
 PERMISSIVE_SECOND_LINE = (os.getenv("PERMISSIVE_SECOND_LINE", "0").strip() == "1")
 
 def check_token(x_autocata_token: str = Header(default="")):
@@ -55,7 +55,6 @@ BAD_TOKENS = {
     "CATASTRAL","TITULARIDAD","PRINCIPAL"
 }
 
-# geo/dir abreviaturas típicas que NO son parte del nombre
 ADDR_STOP = {
     "CL","CALLE","AV","AVDA","AVENIDA","CM","CARRETERA","LG","LUGAR","ES","ESC",
     "BLOQUE","PL","PT","PISO","PORTAL","KM","URB","POL","POLIGONO","C/","PZA","PLZ",
@@ -171,7 +170,6 @@ def ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
     return txt.strip()
 
 def clean_owner_tokens(line: str) -> str:
-    """Limpia una línea de OCR asumiendo que es 'APELLIDOS NOMBRE / RAZÓN SOCIAL'."""
     if not line: return ""
     toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", line.upper()) if t]
     out = []
@@ -180,10 +178,8 @@ def clean_owner_tokens(line: str) -> str:
         if t in ADDR_STOP or t in GEO_TOKENS: break
         if t in BAD_TOKENS: continue
         out.append(t)
-        # nombre típico: 2–4 palabras útiles
         if len([x for x in out if x not in NAME_CONNECTORS]) >= 4:
             break
-    # compactar conectores al inicio
     compact = []
     for t in out:
         if (not compact) and t in NAME_CONNECTORS:
@@ -195,23 +191,15 @@ def clean_owner_tokens(line: str) -> str:
 # Extracción por filas (línea 1 + posible línea 2)
 # ──────────────────────────────────────────────────────────────────────────────
 def owner_rois_for_row(bgr: np.ndarray, row_y: int) -> Tuple[Tuple[int,int,int,int], Tuple[int,int,int,int]]:
-    """
-    Calcula ROI de línea 1 y línea 2 para el titular en la columna
-    'Apellidos Nombre / Razón social', con recorte aproximado por NIF si se detecta.
-    """
     h, w = bgr.shape[:2]
-    # Banda vertical alrededor de la fila
     pad_y = int(h * 0.10)
     y0s = max(0, row_y - pad_y)
     y1s = min(h, row_y + pad_y)
-
-    # Columna del bloque de texto (izquierda de NIF)
-    x_text0 = int(w * 0.26)     # un poco más a la izquierda (360 dpi → previene “mordiscos”)
+    x_text0 = int(w * 0.26)
     x_text1 = int(w * 0.95)
 
     band = bgr[y0s:y1s, x_text0:x_text1]
     if band.size == 0:
-        # fallback conservador
         line_h = int(h * 0.036)
         y1_top = max(0, row_y - int(h*0.01))
         roi1 = (x_text0, y1_top, int(x_text0 + 0.55*(x_text1-x_text0)), y1_top + line_h)
@@ -240,11 +228,9 @@ def owner_rois_for_row(bgr: np.ndarray, row_y: int) -> Tuple[Tuple[int,int,int,i
             if T == "NIF":
                 x_nif_local = lx
                 header_bottom = max(header_bottom or 0, ty + hh)
-
         if header_bottom is not None:
             break
 
-    # si no encontramos cabecera, estimamos alturas
     line_h = int(h * 0.036)
     gap_h  = int(h * 0.008)
     if header_bottom is None:
@@ -252,7 +238,6 @@ def owner_rois_for_row(bgr: np.ndarray, row_y: int) -> Tuple[Tuple[int,int,int,i
     else:
         y1_top_abs = y0s + header_bottom + 6
 
-    # Cortes horizontales
     if x_nif_local is not None:
         x0 = x_text0
         x1 = min(x_text1, x_text0 + x_nif_local - 6)
@@ -260,7 +245,6 @@ def owner_rois_for_row(bgr: np.ndarray, row_y: int) -> Tuple[Tuple[int,int,int,i
         x0 = x_text0
         x1 = int(x_text0 + 0.55 * (x_text1 - x_text0))
 
-    # ROI línea 1 y 2 (coordenadas absolutas)
     roi1 = (x0, y1_top_abs, x1, min(h, y1_top_abs + line_h))
     roi2 = (x0, roi1[3] + gap_h, x1, min(h, roi1[3] + gap_h + line_h))
     return roi1, roi2
@@ -289,13 +273,14 @@ def read_line_ocr(bgr: np.ndarray, roi: Tuple[int,int,int,int]) -> str:
 
 def merge_two_lines(t1_raw: str, t2_raw: str) -> Tuple[str, dict]:
     """
-    Une línea 1 y posible línea 2 con reglas conservadoras.
-    Acepta 2ª línea si: una sola palabra tipo 'LUIS' o ≤2 tokens alfabéticos sin stop-words ni dígitos.
-    Si PERMISSIVE_SECOND_LINE=1, la fuerza si existe, recortando a 26 chars.
+    Une línea 1 y posible línea 2.
+    Cambios v0.6.1:
+      • 1 solo token en L2: ACEPTA si 4–12 letras (antes 3–12) → evita “ECE”.
+      • 2 tokens: cada uno 3–12 letras, sin geo/addr/stop, total ≤26.
     """
     info = {"picked_from": "strict", "second_line_used": False, "second_line_reason": ""}
 
-    # Normalizar rupturas de línea (a veces Tesseract mete salto de línea en t1)
+    # Si Tesseract partió L1 en dos líneas, únelas
     if "\n" in (t1_raw or ""):
         parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
         if len(parts) >= 2:
@@ -310,22 +295,24 @@ def merge_two_lines(t1_raw: str, t2_raw: str) -> Tuple[str, dict]:
 
     base = clean_owner_tokens(t1_raw)
     extra_raw = (t2_raw or "").strip()
-
     if not extra_raw:
         return base, info
 
-    # Heurística estricta (no forzada)
+    # Tokenizar L2 y filtrar
     toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", extra_raw.upper()) if t]
+    # quitar dígitos y stops
     toks = [t for t in toks if not any(ch.isdigit() for ch in t)]
     toks = [t for t in toks if t not in ADDR_STOP and t not in GEO_TOKENS]
     toks = [t for t in toks if UPPER_NAME_RE.match(t)]
 
-    if len(toks) == 1 and 3 <= len(toks[0]) <= 12:
+    # 1 token: 4–12 letras (LUIS entra; ECE ya no)
+    if len(toks) == 1 and 4 <= len(toks[0]) <= 12:
         name = (base + " " + toks[0]).strip()
         info.update({"second_line_used": True, "second_line_reason": "1tok_ok"})
         return name[:48], info
 
-    if len(toks) == 2 and all(2 <= len(t) <= 12 for t in toks):
+    # 2 tokens: cada uno 3–12 letras y total ≤26
+    if len(toks) == 2 and all(3 <= len(t) <= 12 for t in toks):
         cand = " ".join(toks)
         if len(cand) <= 26:
             name = (base + " " + cand).strip()
@@ -352,7 +339,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # Recorte del bloque de croquis (izq) para detectar centroides
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
@@ -364,7 +350,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         return {"norte":"","sur":"","este":"","oeste":""}, {"rows": [], "timings_ms": {}}, vis
 
     mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
-    mains_abs.sort(key=lambda t: t[1])  # de arriba a abajo
+    mains_abs.sort(key=lambda t: t[1])
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
     rows_dbg = []
@@ -372,7 +358,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:6]:
-        # vecino más cercano para decidir lado
         best = None; best_d = 1e9
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
@@ -382,14 +367,11 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and best_d < (w*0.25)**2:
             side = side_of((mcx, mcy), best)
 
-        # ROIs línea 1 / línea 2
         roi1, roi2 = owner_rois_for_row(bgr, row_y=mcy)
 
-        # OCR línea 1 y 2
         t1_raw = read_line_ocr(bgr, roi1)
         t2_raw = read_line_ocr(bgr, roi2)
 
-        # Unir con reglas (posible 2ª línea)
         owner, merge_info = merge_two_lines(t1_raw, t2_raw)
 
         if side and owner and side not in used_sides:
@@ -397,7 +379,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
             used_sides.add(side)
 
         if annotate:
-            # puntos y etiqueta N/S/E/O
             cv2.circle(vis, (mcx, mcy), 10, (0,255,0), -1)
             if best is not None:
                 cv2.circle(vis, best, 8, (0,0,255), -1)
@@ -410,8 +391,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
                 cv2.putText(vis, owner[:28], (int(w*0.42), mcy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
-
-            # dibuja las cajas usadas para L1/L2
             x0,y0,x1,y1 = roi1; cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
             x0,y0,x1,y1 = roi2; cv2.rectangle(vis, (x0,y0), (x1,y1), (0,200,200), 2)
 
