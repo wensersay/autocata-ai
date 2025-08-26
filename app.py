@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.5.8")
+app = FastAPI(title="AutoCatastro AI", version="0.5.9")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -190,6 +190,7 @@ def clean_owner_line(line: str) -> str:
     return name[:48]
 
 def pick_owner_from_text(txt: str) -> str:
+    """Parser estricto para L1 (usa regex)."""
     if not txt: return ""
     lines = [l.strip() for l in txt.split("\n") if l.strip()]
     for l in lines:
@@ -202,10 +203,37 @@ def pick_owner_from_text(txt: str) -> str:
             return name
     return ""
 
+def fallback_owner_from_raw(raw: str) -> str:
+    """
+    Fallback permisivo para L1 cuando el parser estricto no acepta.
+    Quita números/corchetes/meta y tokens geográficos, conserva conectores,
+    y devuelve hasta 48 chars si hay suficientes letras.
+    """
+    if not raw: return ""
+    # cortar en primer dígito/corchete por seguridad
+    raw = re.split(r"[\[\]0-9]", raw.upper())[0]
+    raw = re.sub(r"[^A-ZÁÉÍÓÚÜÑ' \-]", " ", raw)
+    raw = re.sub(r"\s{2,}", " ", raw).strip()
+    if not raw: return ""
+    toks = [t for t in raw.split() if t]
+    out = []
+    for t in toks:
+        if t in BAD_TOKENS or t in GEO_TOKENS:
+            break
+        out.append(t)
+        # límite de tokens útiles (4 + conectores)
+        if len([x for x in out if x not in NAME_CONNECTORS]) >= 4:
+            break
+    cand = " ".join(out).strip()
+    # requiere mínimo 2 tokens alfabéticos y 8 chars
+    if len([t for t in out if t not in NAME_CONNECTORS]) >= 2 and len(cand) >= 8:
+        return cand[:48]
+    return ""
+
 def clean_second_line(raw: str) -> str:
     if not raw: return ""
     s = raw.upper().replace("\n", " ")
-    s = re.split(r"[\[\]:0-9]", s)[0]                       # cortar en meta/num
+    s = re.split(r"[\[\]:0-9]", s)[0]
     s = re.sub(r"[^A-ZÁÉÍÓÚÜÑ' \-]", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
@@ -213,7 +241,7 @@ def clean_second_line(raw: str) -> str:
 def validate_second_line(s: str) -> Optional[str]:
     """
     Acepta si:
-      - Contiene algún token del WHITELIST (p.ej. LUIS), o
+      - Contiene un token del WHITELIST (p.ej. LUIS), o
       - Todos los tokens son alfabéticos, con vocales, y longitud >=3,
         no en NOISE_2NDLINE/GEO_TOKENS/BAD_TOKENS.
     Limita a SECOND_LINE_MAXTOKENS y SECOND_LINE_MAXCHARS.
@@ -303,7 +331,7 @@ def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
     return x0, x1, y0, y1, dbg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Extraer dueño por fila (con 2ª línea robusta y validada)
+# Extraer dueño por fila (con 2ª línea robusta y fallback en L1)
 # ──────────────────────────────────────────────────────────────────────────────
 def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     h, w = bgr.shape[:2]
@@ -317,6 +345,7 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     name1 = ""
     t1_raw = ""
     t1_extra_raw = ""
+    picked_from = "none"
     if roi1.size != 0:
         g1 = cv2.cvtColor(roi1, cv2.COLOR_BGR2GRAY)
         g1 = cv2.resize(g1, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
@@ -332,10 +361,18 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
         ]
         best = max(variants, key=lambda t: sum(ch.isalpha() for ch in t))
         t1_raw = best or ""
-        # Si t1 trae varias líneas (caso “JOSE\nLUIS”), priorizamos esa segunda
         parts = [p.strip() for p in (t1_raw.split("\n")) if p.strip()]
         if parts:
-            name1 = pick_owner_from_text(parts[0])
+            strict_try = pick_owner_from_text(parts[0])
+            if strict_try:
+                name1 = strict_try
+                picked_from = "strict"
+            else:
+                # Fallback permisivo si el estricto no valida
+                fb = fallback_owner_from_raw(parts[0])
+                if fb:
+                    name1 = fb
+                    picked_from = "fallback"
             if len(parts) >= 2:
                 t1_extra_raw = parts[1]
 
@@ -343,21 +380,19 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     second_used = False
     second_reason = ""
     t2_raw = ""
-    cand2_from_t1 = None
-    if SECOND_LINE_FORCE and t1_extra_raw:
+    if SECOND_LINE_FORCE and t1_extra_raw and name1:
         raw2 = clean_second_line(t1_extra_raw)
-        cand2_from_t1 = validate_second_line(raw2)
+        cand2_from_t1 = validate_second_line(raw2) if SECOND_LINE_STRICT else (raw2[:SECOND_LINE_MAXCHARS] or None)
         if cand2_from_t1:
             second_used = True
             second_reason = "from_l1_break"
             name1 = (name1 + " " + cand2_from_t1).strip()
 
-    # Si aún no hemos añadido 2ª línea y está permitido: mirar justo debajo de L1
-    if SECOND_LINE_FORCE and not second_used and (x1 - x0) > 10:
+    # Si aún no hemos añadido 2ª línea: mirar debajo de L1
+    if SECOND_LINE_FORCE and not second_used and name1 and (x1 - x0) > 10:
         line_h = (y1_1 - y1_0)
         y2_0 = min(h, y1_1 + 6)
         y2_1 = min(h, y2_0 + max(14, line_h))
-        # Barrido vertical + multi-PSM
         offsets = [0, +int(0.35*line_h), -int(0.25*line_h), +int(0.6*line_h)]
         best_txt = ""
         best_score = -1
@@ -402,6 +437,7 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
         "t1_raw": t1_raw,
         "t1_extra_raw": t1_extra_raw,
         "t2_raw": t2_raw,
+        "picked_from": picked_from,
         "second_line_used": second_used,
         "second_line_reason": second_reason,
         "header_found": hdr_dbg.get("header_found", False),
@@ -515,7 +551,7 @@ def preview_get(
         blank = np.zeros((240, 640, 3), np.uint8)
         cv2.putText(blank, f"ERR: {err[:60]}", (10,120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        ok, png = cv2. imencode(".png", blank)
+        ok, png = cv2.imencode(".png", blank)
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
     ok, png = cv2.imencode(".png", vis)
@@ -544,8 +580,12 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
     try:
         bgr = page2_bgr(pdf_bytes)
         linderos, vdbg, _vis = detect_rows_and_extract(bgr, annotate=False)
-        owners_detected = [o["owner"] for o in vdbg["rows"] if o.get("owner")]
-        owners_detected = list(dict.fromkeys(owners_detected))[:8]
+
+        # owners_detected prioriza linderos válidos y añade filas con owner
+        od = [v for v in [linderos.get("norte"), linderos.get("sur"),
+                          linderos.get("este"),  linderos.get("oeste")] if v]
+        od += [o["owner"] for o in vdbg["rows"] if o.get("owner")]
+        owners_detected = list(dict.fromkeys(od))[:8]
 
         note = None
         if not any(linderos.values()):
@@ -561,6 +601,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
-
 
