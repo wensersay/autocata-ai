@@ -410,35 +410,35 @@ def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]
                 t2_final = t2_raw
                 break
 
-    # Limpieza y aceptación de 2ª línea
-name1 = pick_owner_from_text(t1) or clean_owner_line(t1)
+        # Limpieza y aceptación de 2ª línea
+    name1 = pick_owner_from_text(t1) or clean_owner_line(t1)
 
-force_second = (os.getenv("SECOND_LINE_FORCE", "0").strip() == "1")
+    force_second = (os.getenv("SECOND_LINE_FORCE", "0").strip() == "1")
 
-if force_second:
-    # Modo permisivo: aceptar lo que haya hasta 26 chars, cortando por dígito/[:]
-    t2_cut = re.split(r"[\d\[:]", t2_final or "", maxsplit=1)[0].strip()
-    line2 = (t2_cut[:26] if t2_cut else "")
-    ok2 = bool(line2)
-    reason2 = "forced" if ok2 else "empty"
-else:
-    ok2, why2 = is_probable_name_continuation(t2_final)
-    line2 = (t2_final.strip()[:26] if ok2 else "")
-    reason2 = why2.get("reason","")
+    if force_second:
+        # Modo permisivo: aceptar lo que haya hasta 26 chars, cortando por dígito/[:]
+        t2_cut = re.split(r"[\d\[:]", t2_final or "", maxsplit=1)[0].strip()
+        line2 = (t2_cut[:26] if t2_cut else "")
+        ok2 = bool(line2)
+        reason2 = "forced" if ok2 else "empty"
+    else:
+        ok2, why2 = is_probable_name_continuation(t2_final)
+        line2 = (t2_final.strip()[:26] if ok2 else "")
+        reason2 = why2.get("reason","")
 
-return name1, line2, {
-    "band":[x_text0,y0s,x_text1,y1s],
-    "y_line1":[y1_0,y1_1],
-    "y_line2":[y2_0,y2_1],
-    "x0": x0, "x1": x1,
-    "t1_raw":t1, "t2_raw":t2_final,
-    "t2_try": t2_try,
-    "t2_box": t2_box,
-    "second_line_used": bool(line2),
-    "second_line_reason": reason2,
-    "header_found": header_bot is not None,
-    "x_nif_found": x_nif is not None
-}
+    return name1, line2, {
+        "band":[x_text0,y0s,x_text1,y1s],
+        "y_line1":[y1_0,y1_1],
+        "y_line2":[y2_0,y2_1],
+        "x0": x0, "x1": x1,
+        "t1_raw":t1, "t2_raw":t2_final,
+        "t2_try": t2_try,
+        "t2_box": t2_box,
+        "second_line_used": bool(line2),
+        "second_line_reason": reason2,
+        "header_found": header_bot is not None,
+        "x_nif_found": x_nif is not None
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
