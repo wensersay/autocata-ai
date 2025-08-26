@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.8")
+app = FastAPI(title="AutoCatastro AI", version="0.4.9")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -60,6 +60,9 @@ ADDR_PREFIX = {"CL","C/","CALLE","AV","AV.","AVDA","AVENIDA","LG","LUGAR","CM","
 
 # Conectores válidos dentro de un nombre
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
+
+# Tokens de ruido OCR muy comunes en 2ª línea (descartar)
+NOISE_TOKENS = {"SSS","SE","ST","KO","CS","CO","CSV","OS","O"}
 
 # Nombres propios muy comunes (para decidir si la 2ª línea es útil)
 COMMON_GIVEN = {
@@ -171,10 +174,13 @@ def sanitize_tokens(line: str) -> List[str]:
     toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", (line or "").upper()) if t]
     clean = []
     for t in toks:
+        if t in NOISE_TOKENS:     continue
         if any(ch.isdigit() for ch in t): break
-        if t in BAD_TOKENS: continue
-        if t in GEO_TOKENS: break
+        if t in BAD_TOKENS:       continue
+        if t in GEO_TOKENS:       break
         if len(t) == 1 and t not in NAME_CONNECTORS: continue
+        # descarta repeticiones tipo "SSS"
+        if re.match(r"^(.)\1{2,}$", t): continue
         clean.append(t)
     return clean
 
@@ -203,25 +209,26 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 def merge_first_second_line(first: str, second: str) -> str:
-    """Funde 2ª línea si parece continuación del nombre (p.ej., 'LUIS')."""
+    """Funde 2ª línea solo si parece continuación de NOMBRE (evita ruidos tipo SSS/SE/ST/KO/CS/CO)."""
     if not first: return ""
     if not second: return first
 
     t2 = sanitize_tokens(second)
-    # descarta prefijos claros de dirección/campos
-    if t2 and (t2[0] in ADDR_PREFIX or t2[0].endswith(":")):
-        return first
-    # quedarse solo con 1–2 tokens alfabéticos válidos
-    t2 = [t for t in t2 if t not in BAD_TOKENS and t not in GEO_TOKENS]
     if not t2:
         return first
+    # descarta claro inicio de dirección
+    if t2[0] in ADDR_PREFIX or t2[0].endswith(":"):
+        return first
 
+    # Solo 1–2 tokens alfabéticos válidos
     take = []
     for t in t2:
+        if t in NOISE_TOKENS:                 continue
         if len(t) <= 2 and t not in NAME_CONNECTORS:
             continue
-        if any(ch.isdigit() for ch in t):
-            break
+        if any(ch.isdigit() for ch in t):     break
+        # evita repeticiones AAA/SSS
+        if re.match(r"^(.)\1{2,}$", t):       continue
         take.append(t)
         if len(take) >= 2:
             break
@@ -229,11 +236,9 @@ def merge_first_second_line(first: str, second: str) -> str:
     if not take:
         return first
 
-    # Señal de continuación válida:
-    #  - primer token común de nombre o longitud decente (>=3)
-    if (take[0] in COMMON_GIVEN) or (len(take[0]) >= 3):
+    # Señal de continuación válida: primer token es nombre común o palabra ≥4
+    if (take[0] in COMMON_GIVEN) or (len(take[0]) >= 4):
         merged = (first + " " + " ".join(take)).strip()
-        # poda conservadora (evitar meter dirección entera)
         return merged[:54]
     return first
 
@@ -315,7 +320,6 @@ def ocr_line(bgr: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> str:
         ocr_text(bwi, psm=7,  whitelist=WL),
         ocr_text(bw,  psm=13, whitelist=WL),
     ]
-    # Devuelve la primera “con pinta” de nombre; si no, la más larga
     best = ""
     for v in variants:
         name = pick_owner_from_text(v)
@@ -323,7 +327,6 @@ def ocr_line(bgr: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> str:
             return name
         if len(v) > len(best):
             best = v
-    # Como fallback, intenta limpiar el mejor bruto
     return compact_name(sanitize_tokens(best))
 
 def extract_owner_two_lines(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
@@ -332,11 +335,9 @@ def extract_owner_two_lines(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     Devuelve (owner_final, dbg_dict)
     """
     h, w = bgr.shape[:2]
-    # Base de columna (ligeramente más a la izquierda para no "morder")
-    x_text0_base = int(w * 0.33)
+    x_text0_base = int(w * 0.33)   # algo más a la izq. para no “morder” iniciales
     x_text1      = int(w * 0.96)
 
-    # Explora 2 intentos ampliando a la izquierda si la 1ª línea queda recortada
     txt1 = txt2 = ""
     roi1 = roi2 = (0,0,0,0)
     used_attempt = 0
@@ -346,14 +347,13 @@ def extract_owner_two_lines(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
         x0_base = max(0, x_text0_base - extra_left)
         x0, x1, y0, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
 
-        # 1ª línea
         t1 = ocr_line(bgr, x0, y0, x1, y1)
 
-        # Si la 1ª empieza con una única letra (típico de recorte), forzamos otro intento
+        # si la 1ª queda como una sola letra → reintentar con más apertura a la izq
         if attempt == 0 and re.match(r"^[A-ZÁÉÍÓÚÜÑ]\b", t1 or ""):
             continue
 
-        # 2ª línea inmediatamente debajo con misma altura
+        # 2ª línea del mismo alto, inmediatamente debajo
         line_h = max(10, y1 - y0)
         y0b = min(h-1, y1 + 2)
         y1b = min(h, y0b + line_h)
@@ -367,7 +367,7 @@ def extract_owner_two_lines(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     owner1 = txt1
     owner2 = txt2
 
-    # Funde 2ª línea si procede
+    # Fusión con reglas estrictas para evitar ruido (SSS/SE/ST/KO/CS/CO, etc.)
     owner_final = merge_first_second_line(owner1, owner2)
 
     dbg = {
@@ -437,12 +437,9 @@ def detect_rows_and_extract(bgr: np.ndarray,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
                 cv2.putText(vis, owner_final[:28], (int(w*0.42), mcy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
-
-            # dibuja ROIs
-            x0,y0,x1,y1 = dbg_owner["roi1"]
-            cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
-            x0,y0,x1,y1 = dbg_owner["roi2"]
-            cv2.rectangle(vis, (x0,y0), (x1,y1), (255,200,0), 2)
+            # ROIs de las dos líneas
+            x0,y0,x1,y1 = dbg_owner["roi1"]; cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
+            x0,y0,x1,y1 = dbg_owner["roi2"]; cv2.rectangle(vis, (x0,y0), (x1,y1), (255,200,0), 2)
 
         rows_dbg.append({
             "row_y": mcy,
@@ -536,5 +533,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
