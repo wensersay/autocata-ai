@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.11")
+app = FastAPI(title="AutoCatastro AI", version="0.4.8")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -45,16 +45,27 @@ UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", 
 BAD_TOKENS = {
     "POLÍGONO","POLIGONO","PARCELA","APELLIDOS","NOMBRE","RAZON","RAZÓN",
     "SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA",
-    "CATASTRAL","TITULARIDAD","PRINCIPAL","APELLIDOS NOMBRE","RAZON SOCIAL"
+    "CATASTRAL","TITULARIDAD","PRINCIPAL","CSV"
 }
 
+# Ruido geográfico y etiquetas frecuentes que NO son parte del nombre
 GEO_TOKENS = {
-    "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
+    "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
-    "GALICIA","[LUGO]","[BARCELONA]"
+    "GALICIA","[LUGO]","[BARCELONA]","OS","O","O."
 }
 
+# Prefijos típicos de direcciones/etiquetas que cortan la segunda línea
+ADDR_PREFIX = {"CL","C/","CALLE","AV","AV.","AVDA","AVENIDA","LG","LUGAR","CM","CM.","CMNO","CAMINO","PZ","PL","PLAZA","ES:C","ES:","BLOQUE","ESC","ESC.","BL","BL."}
+
+# Conectores válidos dentro de un nombre
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
+
+# Nombres propios muy comunes (para decidir si la 2ª línea es útil)
+COMMON_GIVEN = {
+    "JOSE","MARIA","JESUS","ANGEL","MIGUEL","LUIS","JUAN","ANTONIO","FRANCISCO",
+    "CARLOS","MANUEL","JOSEFA","TERESA","PILAR","DOLORES","ROSA","ANA"
+}
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -84,24 +95,24 @@ def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
     pil: Image.Image = pages[0].convert("RGB")
-    return np.array(pil)[:, :, ::-1]
+    return np.array(pil)[:, :, ::-1]  # RGB→BGR
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # Verde agua (parcela propia)
     g_ranges = [
-        (np.array([35,  20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
-        (np.array([86,  15, 50], np.uint8), np.array([100,255,255], np.uint8)),
+        (np.array([35, 20, 50], np.uint8), np.array([85, 255, 255], np.uint8)),
+        (np.array([86, 15, 50], np.uint8), np.array([100,255,255], np.uint8)),
     ]
+    # Rosa (vecinos)
     p_ranges = [
         (np.array([160, 20, 70], np.uint8), np.array([179,255,255], np.uint8)),
         (np.array([  0, 20, 70], np.uint8), np.array([ 10,255,255], np.uint8)),
     ]
     mg = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in g_ranges:
-        mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
+    for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     mp = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in p_ranges:
-        mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
+    for lo, hi in p_ranges: mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
     k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
     mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3); mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
     mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
@@ -155,23 +166,28 @@ def ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
     txt = re.sub(r"\n{2,}", "\n", txt)
     return txt.strip()
 
-def clean_owner_line(line: str) -> str:
-    if not line: return ""
-    toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", line.upper()) if t]
-    out = []
+def sanitize_tokens(line: str) -> List[str]:
+    # Divide en tokens alfanuméricos/acentuados y filtra basura
+    toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", (line or "").upper()) if t]
+    clean = []
     for t in toks:
         if any(ch.isdigit() for ch in t): break
-        if t in GEO_TOKENS or "[" in t or "]" in t: break
         if t in BAD_TOKENS: continue
+        if t in GEO_TOKENS: break
+        if len(t) == 1 and t not in NAME_CONNECTORS: continue
+        clean.append(t)
+    return clean
+
+def compact_name(tokens: List[str], max_tokens: int = 6, max_chars: int = 48) -> str:
+    out = []
+    for t in tokens:
+        if (not out) and t in NAME_CONNECTORS:
+            continue
         out.append(t)
-        if len([x for x in out if x not in NAME_CONNECTORS]) >= 5:
+        if len([x for x in out if x not in NAME_CONNECTORS]) >= max_tokens:
             break
-    while out and out[0] in NAME_CONNECTORS:  # sin conectores al inicio
-        out.pop(0)
-    if out and len(out[0]) < 3:               # primer token debe ser real
-        out.pop(0)
     name = " ".join(out).strip()
-    return name[:48]
+    return name[:max_chars]
 
 def pick_owner_from_text(txt: str) -> str:
     if not txt: return ""
@@ -181,46 +197,55 @@ def pick_owner_from_text(txt: str) -> str:
         if any(tok in U for tok in BAD_TOKENS):   continue
         if sum(ch.isdigit() for ch in U) > 1:     continue
         if not UPPER_NAME_RE.match(U):            continue
-        name = clean_owner_line(U)
-        if len(name) >= 8:
+        name = compact_name(sanitize_tokens(U))
+        if len(name) >= 6:
             return name
     return ""
 
-def salvage_tokens(txt: str) -> str:
-    if not txt: return ""
-    U = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s']", " ", (txt or "").upper())
-    toks = [t for t in U.split() if 3 <= len(t) <= 12 and t not in BAD_TOKENS and t not in GEO_TOKENS]
-    toks = [t for t in toks if not any(ch.isdigit() for ch in t)]
-    if not toks: return ""
-    return " ".join(toks[:2])
+def merge_first_second_line(first: str, second: str) -> str:
+    """Funde 2ª línea si parece continuación del nombre (p.ej., 'LUIS')."""
+    if not first: return ""
+    if not second: return first
 
-def join_name_lines(line1: str, line2: str, raw2: str = "") -> str:
-    l1 = clean_owner_line(line1 or "")
-    l2 = clean_owner_line(line2 or "")
-    if not l1 and not l2:
-        l2_alt = salvage_tokens(raw2)
-        return l2_alt
-    if l1 and not l2:
-        l2_alt = salvage_tokens(raw2)
-        return (l1 + (" " + l2_alt if l2_alt else "")).strip()
-    if l2 and not l1:
-        return l2
-    if l2 in l1 or len(l2) < 3:
-        return l1
-    return (l1 + " " + l2).strip()
+    t2 = sanitize_tokens(second)
+    # descarta prefijos claros de dirección/campos
+    if t2 and (t2[0] in ADDR_PREFIX or t2[0].endswith(":")):
+        return first
+    # quedarse solo con 1–2 tokens alfabéticos válidos
+    t2 = [t for t in t2 if t not in BAD_TOKENS and t not in GEO_TOKENS]
+    if not t2:
+        return first
 
-def first_token_len(name: str) -> int:
-    toks = [t for t in (name or "").split() if t]
-    return len(toks[0]) if toks else 0
+    take = []
+    for t in t2:
+        if len(t) <= 2 and t not in NAME_CONNECTORS:
+            continue
+        if any(ch.isdigit() for ch in t):
+            break
+        take.append(t)
+        if len(take) >= 2:
+            break
+
+    if not take:
+        return first
+
+    # Señal de continuación válida:
+    #  - primer token común de nombre o longitud decente (>=3)
+    if (take[0] in COMMON_GIVEN) or (len(take[0]) >= 3):
+        merged = (first + " " + " ".join(take)).strip()
+        # poda conservadora (evitar meter dirección entera)
+        return merged[:54]
+    return first
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar columna y extraer DOS líneas del titular (alineado real)
+# Localizar columna y 2 líneas de titular
 # ──────────────────────────────────────────────────────────────────────────────
-def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
-                                x_text0: int, x_text1: int) -> Tuple[int,int,int,int,int,int,dict]:
+def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
+                               x_text0: int, x_text1: int) -> Tuple[int,int,int,int]:
     """
-    Devuelve (x0, x1, y0_line1, y1_line1, y0_line2, y1_line2, dbg)
-    usando el x real de la cabecera (APELLIDOS/RAZÓN) cuando se detecta.
+    Devuelve (x0, x1, y0, y1) para la banda de la 1ª línea del titular.
+    Busca 'APELLIDOS' (o 'NIF') y coloca y0 justo debajo.
+    Alto aprox de una línea (~3.5% de alto de página).
     """
     h, w = bgr.shape[:2]
     pad_y = int(h * 0.06)
@@ -228,17 +253,10 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
     y1s = min(h, row_y + pad_y)
 
     band = bgr[y0s:y1s, x_text0:x_text1]
-    line_h = max(18, int(h * 0.035))
-    dbg = {"band":[x_text0,y0s,x_text1,y1s], "header_left": None, "x_nif": None}
-
     if band.size == 0:
         y0 = max(0, row_y - int(h*0.01))
-        y1 = min(h, y0 + line_h)
-        y2 = min(h, y1 + 2)
-        y3 = min(h, y2 + line_h)
-        x0 = x_text0
-        x1 = int(x_text0 + 0.55*(x_text1-x_text0))
-        return x0, x1, y0, y1, y2, y3, dbg
+        y1 = min(h, y0 + int(h*0.035))
+        return x_text0, int(x_text0 + 0.55*(x_text1-x_text0)), y0, y1
 
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = binarize(gray)
@@ -253,170 +271,115 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
 
         x_nif = None
         header_bottom = None
-        header_left = None
 
         for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
             if not t: continue
             T = t.upper()
-            if ("APELLIDOS" in T) or ("APELLIDOS NOMBRE" in T) or ("RAZON" in T) or ("RAZÓN" in T):
+            if "APELLIDOS" in T:
                 header_bottom = max(header_bottom or 0, ty + hh)
-                header_left = lx if (header_left is None or lx < header_left) else header_left
             if T == "NIF":
                 x_nif = lx
                 header_bottom = max(header_bottom or 0, ty + hh)
 
         if header_bottom is not None:
-            y0_line1 = y0s + header_bottom + 6
-            y1_line1 = min(h, y0_line1 + line_h)
-            y0_line2 = min(h, y1_line1 + 2)
-            y1_line2 = min(h, y0_line2 + line_h)
-
-            # margen adaptativo: si header_left es muy bajo, expandir mucho más
-            base_margin = 28 if FAST_MODE else 36
-            extra_margin = int(0.10 * (x_text1 - x_text0)) if (header_left is not None and header_left <= 6) else 0
-            margin = base_margin + extra_margin
-
-            if header_left is not None:
-                x0 = max(0, x_text0 + header_left - margin)
-            else:
-                x0 = max(0, x_text0 - int(0.02*(x_text1-x_text0)))
-
+            y0 = y0s + header_bottom + 6
+            y1 = min(h, y0 + int(h * 0.035))  # 1 línea
             if x_nif is not None:
+                x0 = x_text0
                 x1 = min(x_text1, x_text0 + x_nif - 8)
             else:
+                x0 = x_text0
                 x1 = int(x_text0 + 0.55*(x_text1-x_text0))
+            if x1 - x0 > (x_text1 - x_text0) * 0.22:
+                return x0, x1, y0, y1
 
-            dbg["header_left"] = int(header_left) if header_left is not None else None
-            dbg["x_nif"] = int(x_nif) if x_nif is not None else None
-            return x0, x1, y0_line1, y1_line1, y0_line2, y1_line2, dbg
-
-    # Fallback
+    # fallback
     y0 = max(0, row_y - int(h*0.01))
-    y1 = min(h, y0 + line_h)
-    y2 = min(h, y1 + 2)
-    y3 = min(h, y2 + line_h)
+    y1 = min(h, y0 + int(h*0.035))
     x0 = x_text0
     x1 = int(x_text0 + 0.55*(x_text1-x_text0))
-    return x0, x1, y0, y1, y2, y3, dbg
+    return x0, x1, y0, y1
 
-def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict, int]:
+def ocr_line(bgr: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> str:
+    roi = bgr[y0:y1, x0:x1]
+    if roi.size == 0: return ""
+    g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+    g = enhance_gray(g)
+    bw, bwi = binarize(g)
+    WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '-"
+    variants = [
+        ocr_text(bw,  psm=6,  whitelist=WL),
+        ocr_text(bwi, psm=6,  whitelist=WL),
+        ocr_text(bw,  psm=7,  whitelist=WL),
+        ocr_text(bwi, psm=7,  whitelist=WL),
+        ocr_text(bw,  psm=13, whitelist=WL),
+    ]
+    # Devuelve la primera “con pinta” de nombre; si no, la más larga
+    best = ""
+    for v in variants:
+        name = pick_owner_from_text(v)
+        if name:
+            return name
+        if len(v) > len(best):
+            best = v
+    # Como fallback, intenta limpiar el mejor bruto
+    return compact_name(sanitize_tokens(best))
+
+def extract_owner_two_lines(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     """
-    Devuelve (owner_joined, debug_dict, attempt_used).
-    Hasta 5 intentos, expandiendo x0 a la izquierda si muerde letras.
-    Si header_left es muy pequeño (cabecera pegada al borde) no aceptamos
-    en intentos tempranos y forzamos más expansión a la izquierda.
+    Extrae 1ª y 2ª línea del titular y las fusiona si la 2ª parece continuación.
+    Devuelve (owner_final, dbg_dict)
     """
     h, w = bgr.shape[:2]
-    x_text0 = int(w * 0.33)
-    x_text1 = int(w * 0.96)
+    # Base de columna (ligeramente más a la izquierda para no "morder")
+    x_text0_base = int(w * 0.33)
+    x_text1      = int(w * 0.96)
 
-    best = ("", {"roi1":None,"roi2":None,"txt1":"","txt2":"","header_left":None,"x_nif":None}, -1)
+    # Explora 2 intentos ampliando a la izquierda si la 1ª línea queda recortada
+    txt1 = txt2 = ""
+    roi1 = roi2 = (0,0,0,0)
+    used_attempt = 0
 
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        extra_left = attempt * max(32, int(w * 0.08))  # expansión más agresiva
-        x0_base = max(0, x_text0 - extra_left)
-        x0, x1, y01, y11, y02, y12, dbg_hdr = find_header_and_owner_bands(bgr, row_y, x0_base, x_text1)
+    for attempt in range(2):
+        extra_left = attempt * max(18, int(w * 0.03))
+        x0_base = max(0, x_text0_base - extra_left)
+        x0, x1, y0, y1 = find_header_and_owner_band(bgr, row_y, x0_base, x_text1)
 
-        roi1 = bgr[y01:y11, x0:x1]
-        roi2 = bgr[y02:y12, x0:x1]
+        # 1ª línea
+        t1 = ocr_line(bgr, x0, y0, x1, y1)
 
-        owner1 = owner2 = ""
-        txt1 = txt2 = ""
+        # Si la 1ª empieza con una única letra (típico de recorte), forzamos otro intento
+        if attempt == 0 and re.match(r"^[A-ZÁÉÍÓÚÜÑ]\b", t1 or ""):
+            continue
 
-        if roi1.size:
-            g1 = cv2.cvtColor(roi1, cv2.COLOR_BGR2GRAY)
-            g1 = cv2.resize(g1, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-            g1 = enhance_gray(g1)
-            bw1, bwi1 = binarize(g1)
-            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-            cands1 = [
-                ocr_text(bw1,  psm=7, whitelist=WL),
-                ocr_text(bwi1, psm=7, whitelist=WL),
-                ocr_text(bw1,  psm=6, whitelist=WL),
-                ocr_text(bwi1, psm=6, whitelist=WL),
-            ]
-            for c in cands1:
-                txt1 = c
-                owner1 = pick_owner_from_text(c)
-                if owner1: break
+        # 2ª línea inmediatamente debajo con misma altura
+        line_h = max(10, y1 - y0)
+        y0b = min(h-1, y1 + 2)
+        y1b = min(h, y0b + line_h)
+        t2  = ocr_line(bgr, x0, y0b, x1, y1b)
 
-        if roi2.size:
-            g2 = cv2.cvtColor(roi2, cv2.COLOR_BGR2GRAY)
-            g2 = cv2.resize(g2, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-            g2 = enhance_gray(g2)
-            bw2, bwi2 = binarize(g2)
-            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-            cands2 = [
-                ocr_text(bw2,  psm=7, whitelist=WL),
-                ocr_text(bwi2, psm=7, whitelist=WL),
-                ocr_text(bw2,  psm=6, whitelist=WL),
-                ocr_text(bwi2, psm=6, whitelist=WL),
-            ]
-            for c in cands2:
-                txt2 = c
-                owner2 = pick_owner_from_text(c)
-                if owner2: break
+        txt1, txt2 = t1, t2
+        roi1, roi2 = (x0, y0, x1, y1), (x0, y0b, x1, y1b)
+        used_attempt = attempt
+        break
 
-        joined = join_name_lines(owner1, owner2, raw2=txt2)
+    owner1 = txt1
+    owner2 = txt2
 
-        # Calidad mínima + heurística de cabecera pegada (posible corte por la izquierda)
-        header_left = dbg_hdr.get("header_left")
-        accept = bool(joined) and (first_token_len(joined) >= 3) and (len(joined) >= 10)
+    # Funde 2ª línea si procede
+    owner_final = merge_first_second_line(owner1, owner2)
 
-        # si la cabecera está demasiado a la izquierda, no aceptamos temprano
-        if header_left is not None and header_left <= 6 and attempt < (max_attempts - 1):
-            accept = False  # fuerza más expansión hacia la izquierda
-
-        cand_dbg = {
-            "roi1":[x0,y01,x1,y11], "roi2":[x0,y02,x1,y12],
-            "txt1":txt1, "txt2":txt2,
-            "header_left": header_left,
-            "x_nif": dbg_hdr.get("x_nif")
-        }
-
-        if len(joined) > len(best[0]):
-            best = (joined, cand_dbg, attempt)
-
-        if accept:
-            return joined, cand_dbg, attempt
-
-    # Panic-left final: un intento extra muy a la izquierda si quedó pobre
-    if not best[0] or first_token_len(best[0]) < 4:
-        x0_base = max(0, x_text0 - int(0.22 * w))
-        x0, x1, y01, y11, y02, y12, dbg_hdr = find_header_and_owner_bands(bgr, row_y, x0_base, x_text1)
-        roi1 = bgr[y01:y11, x0:x1]
-        roi2 = bgr[y02:y12, x0:x1]
-        owner1 = owner2 = ""
-        txt1 = txt2 = ""
-        if roi1.size:
-            g1 = cv2.cvtColor(roi1, cv2.COLOR_BGR2GRAY)
-            g1 = cv2.resize(g1, None, fx=1.45, fy=1.45, interpolation=cv2.INTER_CUBIC)
-            g1 = enhance_gray(g1)
-            bw1, bwi1 = binarize(g1)
-            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-            for c in [ocr_text(bw1,7,WL), ocr_text(bwi1,7,WL), ocr_text(bw1,6,WL)]:
-                txt1 = c; owner1 = pick_owner_from_text(c)
-                if owner1: break
-        if roi2.size:
-            g2 = cv2.cvtColor(roi2, cv2.COLOR_BGR2GRAY)
-            g2 = cv2.resize(g2, None, fx=1.45, fy=1.45, interpolation=cv2.INTER_CUBIC)
-            g2 = enhance_gray(g2)
-            bw2, bwi2 = binarize(g2)
-            WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-            for c in [ocr_text(bw2,7,WL), ocr_text(bwi2,7,WL), ocr_text(bw2,6,WL)]:
-                txt2 = c; owner2 = pick_owner_from_text(c)
-                if owner2: break
-        joined = join_name_lines(owner1, owner2, raw2=txt2)
-        cand_dbg = {"roi1":[x0,y01,x1,y11], "roi2":[x0,y02,x1,y12], "txt1":txt1, "txt2":txt2,
-                    "header_left": dbg_hdr.get("header_left"), "x_nif": dbg_hdr.get("x_nif")}
-        if joined and len(joined) > len(best[0]):
-            return joined, cand_dbg, max_attempts
-
-    return best[0], best[1], best[2]
+    dbg = {
+        "attempt": used_attempt,
+        "roi1": list(roi1), "roi2": list(roi2),
+        "txt1": owner1, "txt2": owner2,
+        "owner_final": owner_final
+    }
+    return owner_final, dbg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline por filas (con anotaciones opcionales)
+# Pipeline por filas
 # ──────────────────────────────────────────────────────────────────────────────
 def detect_rows_and_extract(bgr: np.ndarray,
                             annotate: bool = False,
@@ -424,7 +387,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # Recorte donde viven croquis + letras
+    # Recorte de franja izquierda donde están los mini-mapas
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
@@ -444,20 +407,21 @@ def detect_rows_and_extract(bgr: np.ndarray,
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:6]:
-        # vecino más cercano en la fila
+        # vecino más cercano
         best = None; best_d = 1e9
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
             if d < best_d:
                 best_d = d; best = (nx, ny)
+
         side = ""
         if best is not None and best_d < (w*0.25)**2:
             side = side_of((mcx, mcy), best)
 
-        owner_joined, owner_dbg, attempt_id = extract_owner_from_row(bgr, row_y=mcy)
+        owner_final, dbg_owner = extract_owner_two_lines(bgr, row_y=mcy)
 
-        if side and owner_joined and side not in used_sides:
-            linderos[side] = owner_joined
+        if side and owner_final and side not in used_sides:
+            linderos[side] = owner_final
             used_sides.add(side)
 
         if annotate:
@@ -468,31 +432,29 @@ def detect_rows_and_extract(bgr: np.ndarray,
                 if lbl:
                     cv2.putText(vis, lbl, (best[0]-8, best[1]-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-            if owner_dbg.get("roi1"):
-                x0,y0,x1,y1 = owner_dbg["roi1"]
-                cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
-            if owner_dbg.get("roi2"):
-                x0,y0,x1,y1 = owner_dbg["roi2"]
-                cv2.rectangle(vis, (x0,y0), (x1,y1), (0,200,200), 2)
-            if annotate_names and owner_joined:
-                cv2.putText(vis, owner_joined[:28], (int(w*0.42), mcy),
+            if annotate_names and owner_final:
+                cv2.putText(vis, owner_final[:28], (int(w*0.42), mcy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
-                cv2.putText(vis, owner_joined[:28], (int(w*0.42), mcy),
+                cv2.putText(vis, owner_final[:28], (int(w*0.42), mcy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
+
+            # dibuja ROIs
+            x0,y0,x1,y1 = dbg_owner["roi1"]
+            cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
+            x0,y0,x1,y1 = dbg_owner["roi2"]
+            cv2.rectangle(vis, (x0,y0), (x1,y1), (255,200,0), 2)
 
         rows_dbg.append({
             "row_y": mcy,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
             "side": side,
-            "owner": owner_joined,
-            "roi1": owner_dbg.get("roi1"),
-            "roi2": owner_dbg.get("roi2"),
-            "txt1": owner_dbg.get("txt1",""),
-            "txt2": owner_dbg.get("txt2",""),
-            "header_left": owner_dbg.get("header_left"),
-            "x_nif": owner_dbg.get("x_nif"),
-            "attempt": attempt_id
+            "txt1": dbg_owner["txt1"],
+            "txt2": dbg_owner["txt2"],
+            "owner": dbg_owner["owner_final"],
+            "roi_attempt": dbg_owner["attempt"],
+            "roi1": dbg_owner["roi1"],
+            "roi2": dbg_owner["roi2"],
         })
 
     dbg = {"rows": rows_dbg}
@@ -515,7 +477,7 @@ def health():
 def preview_get(
     pdf_url: AnyHttpUrl = Query(...),
     labels: int = Query(1, description="1=mostrar N/S/E/O"),
-    names: int = Query(0, description="1=mostrar nombre estimado")
+    names:  int = Query(0, description="1=mostrar nombre estimado")
 ):
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     try:
@@ -539,7 +501,7 @@ def preview_get(
 @app.post("/preview", dependencies=[Depends(check_token)])
 def preview_post(data: ExtractIn = Body(...),
                  labels: int = Query(1),
-                 names: int = Query(0)):
+                 names:  int = Query(0)):
     return preview_get(pdf_url=data.pdf_url, labels=labels, names=names)
 
 @app.post("/extract", response_model=ExtractOut, dependencies=[Depends(check_token)])
@@ -557,7 +519,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
     try:
         bgr = page2_bgr(pdf_bytes)
         linderos, vdbg, _vis = detect_rows_and_extract(bgr, annotate=False)
-        owners_detected = [o["owner"] for o in vdbg["rows"] if o.get("owner")]
+        owners_detected = [o["owner"] for o in vdbg.get("rows", []) if o.get("owner")]
         owners_detected = list(dict.fromkeys(owners_detected))[:8]
 
         note = None
@@ -574,4 +536,5 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
