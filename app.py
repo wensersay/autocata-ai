@@ -13,7 +13,7 @@ import pdfplumber
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.5.2")
+app = FastAPI(title="AutoCatastro AI", version="0.5.3")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -42,6 +42,7 @@ class ExtractOut(BaseModel):
 # Utilidades comunes (texto / OCR)
 # ──────────────────────────────────────────────────────────────────────────────
 UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+
 BAD_TOKENS = {
     "POLÍGONO","POLIGONO","PARCELA","APELLIDOS","NOMBRE","RAZON","RAZÓN",
     "SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA",
@@ -52,7 +53,18 @@ GEO_TOKENS = {
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
     "GALICIA","[LUGO]","[BARCELONA]"
 }
+ADDR_TOKENS = {
+    "CL","CALLE","AV","AVDA","AVENIDA","LG","LUGAR","BLOQUE","ESC","ES",
+    "PL","PISO","PT","PORTAL","URB","URBANIZACION","URBANIZACIÓN","CTRA",
+    "CARRETERA","KM"
+}
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
+
+COMMON_SECOND_NAMES = {
+    "LUIS","MARIA","MARÍA","JAVIER","ANTONIO","MANUEL","MIGUEL","ANGEL","ÁNGEL",
+    "FRANCISCO","CARLOS","ALEJANDRO","JOSE","JOSÉ","PABLO","ALBERTO","ENRIQUE",
+    "DANIEL","RAFAEL","FERNANDO","ALFONSO","CARMEN","ISABEL","JESUS","JESÚS"
+}
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -95,17 +107,28 @@ def ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
     txt = re.sub(r"\n{2,}", "\n", txt)
     return txt.strip()
 
+def _tokens_upper(s: str) -> List[str]:
+    return [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", (s or "").upper()) if t]
+
 def clean_owner_line(line: str) -> str:
     if not line: return ""
-    toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", line.upper()) if t]
+    toks = _tokens_upper(line)
     out = []
+    non_conn = 0
     for t in toks:
         if any(ch.isdigit() for ch in t): break
         if t in GEO_TOKENS or "[" in t or "]" in t: break
-        if t in BAD_TOKENS: continue
+        if t in BAD_TOKENS or t in ADDR_TOKENS: continue
+        # descarta tokens demasiado cortos que no sean conectores
+        if len(t) <= 2 and t not in NAME_CONNECTORS: 
+            continue
         out.append(t)
-        if len([x for x in out if x not in NAME_CONNECTORS]) >= 4:
-            break
+        if t not in NAME_CONNECTORS:
+            non_conn += 1
+            # Limitamos a 3 “tokens de nombre” para evitar colas raras
+            if non_conn >= 3:
+                break
+    # compactar conectores iniciales
     compact = []
     for t in out:
         if (not compact) and t in NAME_CONNECTORS:
@@ -126,6 +149,46 @@ def pick_owner_from_text(txt: str) -> str:
         if len(name) >= 6:
             return name
     return ""
+
+# ────────── heurística para 2ª línea (solo si parece “continuación de nombre”) ──────────
+def is_probable_name_continuation(line: str) -> Tuple[bool, dict]:
+    dbg = {"reason": "ok"}
+    if not line: 
+        dbg["reason"] = "empty"; 
+        return False, dbg
+    # cortar por primer dígito, [, :
+    m = re.search(r"[\d\[:]", line)
+    if m:
+        line = line[:m.start()]
+    toks = _tokens_upper(line)
+    if not toks:
+        dbg["reason"] = "no_tokens"
+        return False, dbg
+    # no geografía ni abreviaturas de dirección
+    if any(t in GEO_TOKENS or t in ADDR_TOKENS for t in toks):
+        dbg["reason"] = "geo_or_addr_token"
+        return False, dbg
+    # máximo 26 chars
+    line = line.strip()[:26]
+    toks = _tokens_upper(line)
+
+    # Regla de tamaño/forma: 1–2 tokens (3 si lleva DE/DEL/Y)
+    if len(toks) == 1:
+        ok = toks[0] in COMMON_SECOND_NAMES or len(toks[0]) >= 3
+        dbg["reason"] = "1tok_ok" if ok else "1tok_too_short_or_unknown"
+        return ok, dbg
+    if len(toks) == 2:
+        # Ambos alfabéticos y no “ruido” muy corto
+        ok = all(len(t) >= 3 or t in NAME_CONNECTORS for t in toks)
+        dbg["reason"] = "2tok_ok" if ok else "2tok_has_short_noise"
+        return ok, dbg
+    if len(toks) == 3 and toks[1] in NAME_CONNECTORS:
+        ok = (len(toks[0]) >= 3 and len(toks[2]) >= 3)
+        dbg["reason"] = "3tok_connector_ok" if ok else "3tok_connector_short"
+        return ok, dbg
+
+    dbg["reason"] = "too_many_tokens"
+    return False, dbg
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Raster (pág. 2) y máscaras
@@ -193,13 +256,6 @@ def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Texto PDF (página 2): dos líneas desde columna (preferente)
 # ──────────────────────────────────────────────────────────────────────────────
-def cut_second_line(line: str) -> str:
-    if not line: return ""
-    m = re.search(r"[\d\[:]", line)
-    if m:
-        line = line[:m.start()]
-    return line.strip()[:26]
-
 def page2_words(pdf_bytes: bytes):
     pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
     try:
@@ -212,7 +268,7 @@ def page2_words(pdf_bytes: bytes):
         pdf.close()
         return None, None, None
 
-def find_column_near_y(words, y_pt: float, y_tol: float = 200.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def find_column_near_y(words, y_pt: float, y_tol: float = 220.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if not words:
         return None, None, None
     cands = []
@@ -294,16 +350,22 @@ def extract_two_lines_from_pdftext(pdf_bytes: bytes, row_y_px: int, bgr_shape: T
         y2_1 = y2_0 + line_h
         w2 = words_in_rect(words, x_left, y2_0, x_right, y2_1)
         raw2 = join_words(w2)
-        txt2 = cut_second_line(raw2)
+        txt2 = raw2.strip()[:26]  # corte duro por 26
 
         name1 = pick_owner_from_text(txt1) or clean_owner_line(txt1)
 
-        return (name1 or "").strip(), (txt2 or "").strip(), {
+        use2, why2 = is_probable_name_continuation(txt2)
+        final2 = txt2 if use2 else ""
+        return (name1 or "").strip(), final2, {
             "x_left": x_left, "x_right": x_right,
             "header_bottom": header_bottom,
             "line1_rect": [x_left, y1_0, x_right, y1_1],
             "line2_rect": [x_left, y2_0, x_right, y2_1],
-            "txt1_raw": txt1, "txt2_raw": raw2, "txt2_final": txt2
+            "txt1_raw": txt1,
+            "txt2_raw": raw2,
+            "txt2_final": final2,
+            "second_line_used": use2,
+            "second_line_reason": why2.get("reason","")
         }
     finally:
         pdf.close()
@@ -353,14 +415,12 @@ def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]
             break
 
     if header_bot is None:
-        # fallback a la heurística (menos precisa, pero evita ruido)
         line_px = max(22, int(h * 0.018))
         y1_0 = y0s + int(0.35*(y1s - y0s))
         y1_1 = y1_0 + line_px
         y2_0 = y1_1 + int(line_px*0.30)
         y2_1 = y2_0 + line_px
     else:
-        # convertir coord band→imagen
         y1_0 = y0s + int(header_bot + 4)
         y1_1 = y1_0 + max(22, int(h*0.018))
         y2_0 = y1_1 + max(6, int(h*0.006))
@@ -382,14 +442,18 @@ def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]
 
     t1 = _ocr_roi(x_text0, y1_0, x_text1, y1_1)
     t2 = _ocr_roi(x_text0, y2_0, x_text1, y2_1)
+
     name1 = pick_owner_from_text(t1) or clean_owner_line(t1)
-    line2 = cut_second_line(t2)
+    ok2, why2 = is_probable_name_continuation(t2)
+    line2 = (t2.strip()[:26] if ok2 else "")
 
     return name1, line2, {
         "band":[x_text0,y0s,x_text1,y1s],
         "y_line1":[y1_0,y1_1],
         "y_line2":[y2_0,y2_1],
         "t1_raw":t1, "t2_raw":t2,
+        "second_line_used": ok2,
+        "second_line_reason": why2.get("reason",""),
         "header_found": header_bot is not None
     }
 
@@ -430,7 +494,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and best_d < (w*0.25)**2:
             side = side_of((mcx, mcy), best)
 
-        # 1) Preferente: TEXTO PDF (px→pt usando tamaño real del raster)
+        # Preferente: PDF-text
         name1_pdf = name2_pdf = ""
         dbg_pdf = {}
         if pdf_bytes is not None:
@@ -440,7 +504,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
             except Exception as e:
                 dbg_pdf = {"pdftext_exception": str(e)}
 
-        # 2) Fallback: OCR anclado a cabecera
+        # Fallback: OCR
         name1, name2 = name1_pdf, name2_pdf
         dbg_ocr = {}
         if not name1 or not name2:
@@ -560,7 +624,4 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
-
-
 
