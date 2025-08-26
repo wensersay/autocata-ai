@@ -4,6 +4,7 @@ from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
 import requests, io, re, os, math
 import numpy as np
+import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
@@ -12,7 +13,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.4.9")
+app = FastAPI(title="AutoCatastro AI", version="0.5.0")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -47,14 +48,8 @@ BAD_TOKENS = {
     "SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA",
     "CATASTRAL","TITULARIDAD","PRINCIPAL","DIRECCIÓN","DIRECCION","COORDENADAS"
 }
-
-GEO_TOKENS = {
-    "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
-    "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
-    "GALICIA","[LUGO]","[BARCELONA]"
-}
-
-ADDR_TOKENS = {"CL","CALLE","AV","AVDA","AVE","LG","LUGAR","PT","PL","PZ","CARRILET","BLOQUE","ES","ESC","NUM","Nº","NO"}
+ADDR_TOKENS = {"CL","CALLE","AV","AVDA","AVE","LG","LUGAR","PT","PL","PZ",
+               "CARRILET","BLOQUE","ES","ESC","NUM","Nº","NO","HUSO","ETRS"}
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
@@ -86,7 +81,7 @@ def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
     pil: Image.Image = pages[0].convert("RGB")
-    return np.array(pil)[:, :, ::-1]
+    return np.array(pil)[:, :, ::-1]  # RGB→BGR
 
 def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -124,7 +119,7 @@ def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
-    ang = math.degrees(math.atan2(-(sy), sx))
+    ang = math.degrees(math.atan2(-(sy), sx))  # Norte arriba
     if -45 <= ang <= 45: return "este"
     if 45 < ang <= 135:  return "norte"
     if -135 <= ang < -45:return "sur"
@@ -161,7 +156,6 @@ def clean_owner_line(line: str) -> str:
     out = []
     for t in toks:
         if any(ch.isdigit() for ch in t): break
-        if t in GEO_TOKENS or "[" in t or "]" in t: break
         if t in BAD_TOKENS or t in ADDR_TOKENS: continue
         out.append(t)
         if len([x for x in out if x not in NAME_CONNECTORS]) >= 4:
@@ -188,10 +182,65 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar cabecera y bandas (línea 1 + línea 2)
+# Leer texto real de la pág. 2 y preparar líneas
+# ──────────────────────────────────────────────────────────────────────────────
+def page2_lines(pdf_bytes: bytes) -> List[str]:
+    out: List[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if len(pdf.pages) >= 2:
+            t = (pdf.pages[1].extract_text(x_tolerance=2, y_tolerance=2) or "")
+            t = t.replace("\r", "\n")
+            t = re.sub(r"[ \t]+", " ", t)
+            t = re.sub(r"\n{2,}", "\n", t)
+            out = [ln.strip() for ln in t.split("\n") if ln.strip()]
+    return out
+
+def first_alpha_prefix(line: str, max_chars: int = 26) -> str:
+    """
+    Devuelve el prefijo alfabético continuo (A–Z/Ñ/espacios/guiones/apóstrofe)
+    antes de que aparezca un dígito, ':', '[' o un token típico de dirección.
+    Se recorta a max_chars.
+    """
+    if not line: return ""
+    # Cortar duro por dígito o corchete/':'
+    m = re.split(r"[:\[\]0-9]", line, maxsplit=1)
+    candidate = m[0] if m else line
+    toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", candidate.upper()) if t]
+    out = []
+    for t in toks:
+        if t in ADDR_TOKENS or t in BAD_TOKENS:
+            break
+        if not re.fullmatch(r"[A-ZÁÉÍÓÚÜÑ'-]+", t):
+            break
+        out.append(t)
+        # no cojas más de 2–3 tokens por seguridad
+        if len(out) >= 3:
+            break
+    name = " ".join(out).strip()
+    return name[:max_chars]
+
+def augment_from_p2(base_name: str, p2_lines_list: List[str]) -> str:
+    """
+    Busca base_name en p2_lines; si lo encuentra, usa la línea siguiente
+    para extraer un prefijo alfabético (p.ej. 'LUIS') y concatenarlo.
+    """
+    if not base_name: return base_name
+    BN = base_name.upper()
+    for i, ln in enumerate(p2_lines_list):
+        if BN in ln.upper():
+            if i + 1 < len(p2_lines_list):
+                nxt = p2_lines_list[i+1]
+                ext = first_alpha_prefix(nxt, max_chars=26)
+                if ext:
+                    return (base_name + " " + ext).strip()
+            break
+    return base_name
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Localizar cabecera y bandas (línea 1 + línea 2 OCR, pero 2ª se sobreescribe por PDF si hay match)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
-                                x_text0: int, x_text1: int) -> Tuple[Tuple[int,int,int,int], Tuple[int,int,int,int], int, Optional[int]]:
+                                x_text0: int, x_text1: int) -> Tuple[Tuple[int,int,int,int], Tuple[int,int,int,int]]:
     h, w = bgr.shape[:2]
     pad_y = int(h * 0.06)
     y0s = max(0, row_y - pad_y)
@@ -204,7 +253,7 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
         y1 = min(h, y0 + line_h)
         roi1 = (x_text0, y0, int(x_text0 + 0.55*(x_text1-x_text0)), y1)
         roi2 = (roi1[0], min(h, roi1[3]+2), roi1[2], min(h, roi1[3]+2+line_h))
-        return roi1, roi2, 0, None
+        return roi1, roi2
 
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = binarize(gray)
@@ -219,7 +268,6 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
         ys = data.get("top", [])
         ws = data.get("width", [])
         hs = data.get("height", [])
-
         for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
             if not t: continue
             T = t.upper()
@@ -228,7 +276,6 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
             if T == "NIF":
                 x_nif = lx
                 header_bottom = max(header_bottom or 0, ty + hh)
-
         if header_bottom is not None:
             break
 
@@ -237,7 +284,7 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
         y1 = min(h, y0 + line_h)
         roi1 = (x_text0, y0, int(x_text0 + 0.55*(x_text1-x_text0)), y1)
         roi2 = (roi1[0], min(h, roi1[3]+2), roi1[2], min(h, roi1[3]+2+line_h))
-        return roi1, roi2, 0, None
+        return roi1, roi2
 
     y1_line1 = y0s + header_bottom + 6
     roi1_y0  = y1_line1
@@ -255,11 +302,10 @@ def find_header_and_owner_bands(bgr: np.ndarray, row_y: int,
     roi2_y0 = min(h, roi1_y1 + gap)
     roi2_y1 = min(h, roi2_y0 + line_h)
     roi2 = (x0, roi2_y0, x1, roi2_y1)
+    return roi1, roi2
 
-    return roi1, roi2, 0, x_nif
-
-def read_owner_two_lines(bgr: np.ndarray, roi1: Tuple[int,int,int,int], roi2: Tuple[int,int,int,int]) -> Tuple[str, str, str]:
-    """Lee ROI1 (filtrado como nombre) y ROI2 SIN FILTRO, concatena ROI2 (máx 26 chars)."""
+def read_owner_two_lines_OCR(bgr: np.ndarray, roi1: Tuple[int,int,int,int], roi2: Tuple[int,int,int,int]) -> Tuple[str, str]:
+    # 1ª línea con filtro (nombre)
     def read_roi_variants(roi: Tuple[int,int,int,int]) -> List[str]:
         x0,y0,x1,y1 = roi
         crop = bgr[y0:y1, x0:x1]
@@ -278,7 +324,6 @@ def read_owner_two_lines(bgr: np.ndarray, roi1: Tuple[int,int,int,int], roi2: Tu
             ocr_text(bw,  psm=13, whitelist=WL),
         ]
 
-    # Línea 1: elegir como nombre válido
     v1 = read_roi_variants(roi1)
     t1 = ""
     for cand in v1:
@@ -286,28 +331,26 @@ def read_owner_two_lines(bgr: np.ndarray, roi1: Tuple[int,int,int,int], roi2: Tu
         if t1:
             break
 
-    # Línea 2: SIN filtro, elegir la variante MÁS LARGA no vacía, normalizar espacios, cortar a 26
+    # 2ª línea por OCR (solo para debug; no se usa si hay refuerzo PDF)
     v2 = [s.strip() for s in read_roi_variants(roi2) if s and s.strip()]
-    t2_raw = ""
-    if v2:
-        t2_raw = max(v2, key=len)
-        t2_raw = re.sub(r"\s+", " ", t2_raw).strip()
-        t2_raw = t2_raw[:26]  # LÍMITE solicitado
+    t2_raw = max(v2, key=len).strip() if v2 else ""
+    t2_raw = re.sub(r"\s+", " ", t2_raw).strip()
+    t2_raw = t2_raw[:26] if t2_raw else ""
 
-    # Concatena siempre si hay t2_raw
     owner = (t1 + (" " + t2_raw if t2_raw else "")).strip() if t1 else t2_raw
-    return owner, t1, t2_raw
+    return owner, t2_raw
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline por filas (con lectura de dos líneas)
+# Pipeline por filas (N/S/E/O + 1ª línea OCR + refuerzo 2ª línea desde PDF)
 # ──────────────────────────────────────────────────────────────────────────────
 def detect_rows_and_extract(bgr: np.ndarray,
+                            p2_lines_list: List[str],
                             annotate: bool = False,
                             annotate_names: bool = False) -> Tuple[Dict[str,str], dict, np.ndarray]:
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # marco de croquis a la izquierda
+    # Marco croquis a la izquierda
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
@@ -327,7 +370,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:6]:
-        # vecino más cercano para orientar lado
+        # vecino más cercano → lado
         best = None; best_d = 1e9
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
@@ -337,15 +380,26 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and best_d < (w*0.25)**2:
             side = side_of((mcx, mcy), best)
 
-        # definir columna de texto amplia; recortamos por NIF si aparece
-        x_text0 = int(w * 0.30)   # más a la izquierda para no cortar primeras letras
+        # columnas de texto
+        x_text0 = int(w * 0.30)
         x_text1 = int(w * 0.96)
+        roi1, roi2 = find_header_and_owner_bands(bgr, mcy, x_text0, x_text1)
 
-        roi1, roi2, attempt_id, x_nif = find_header_and_owner_bands(bgr, mcy, x_text0, x_text1)
-        owner, t1, t2_raw = read_owner_two_lines(bgr, roi1, roi2)
+        # OCR (1ª línea + 2ª solo para debug)
+        owner_ocr, t2_raw = read_owner_two_lines_OCR(bgr, roi1, roi2)
 
-        if side and owner and side not in used_sides:
-            linderos[side] = owner
+        # Refuerzo con texto PDF (buscar la línea siguiente a la coincidencia del nombre de 1ª línea)
+        owner_final = owner_ocr
+        first_line = owner_ocr.split()  # podría incluir ya algo en 2ª por OCR, no importa
+        if first_line:
+            base = " ".join(first_line[:min(len(first_line), 6)])  # base_name razonable
+            base_upper = base.upper()
+            # si detectamos claramente una 1ª línea (>= 2 tokens), usarla para buscar en PDF
+            if len(base_upper.split()) >= 2:
+                owner_final = augment_from_p2(base_upper, p2_lines_list)
+
+        if side and owner_final and side not in used_sides:
+            linderos[side] = owner_final
             used_sides.add(side)
 
         if annotate:
@@ -356,29 +410,22 @@ def detect_rows_and_extract(bgr: np.ndarray,
                 if lbl:
                     cv2.putText(vis, lbl, (best[0]-8, best[1]-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-        if annotate_names and owner:
-            cv2.putText(vis, owner[:28], (int(w*0.42), mcy),
+        if annotate_names and owner_final:
+            cv2.putText(vis, owner_final[:28], (int(w*0.42), mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
-            cv2.putText(vis, owner[:28], (int(w*0.42), mcy),
+            cv2.putText(vis, owner_final[:28], (int(w*0.42), mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
-        # pintar cajas de ROI para depurar
-        x0,y0,x1,y1 = roi1
-        cv2.rectangle(vis, (x0,y0), (x1,y1), (0,255,255), 2)
-        x0,y0,x1,y1 = roi2
-        cv2.rectangle(vis, (x0,y0), (x1,y1), (0,200,200), 2)
 
         rows_dbg.append({
             "row_y": mcy,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
             "side": side,
-            "txt1": t1,           # primera línea (filtrada como nombre)
-            "txt2_raw": t2_raw,   # segunda línea SIN filtro, ya recortada a 26
-            "owner": owner,       # concat incondicional
-            "roi_attempt": attempt_id,
+            "txt1": " ".join(owner_ocr.split()[:6]) if owner_ocr else "",
+            "txt2_raw": t2_raw,
+            "aug_from_p2": owner_final if owner_final != owner_ocr else "",
             "roi1": list(roi1),
             "roi2": list(roi2),
-            "x_nif": x_nif
         })
 
     dbg = {"rows": rows_dbg}
@@ -406,8 +453,9 @@ def preview_get(
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     try:
         bgr = page2_bgr(pdf_bytes)
+        p2_lines_list = page2_lines(pdf_bytes)
         _linderos, _dbg, vis = detect_rows_and_extract(
-            bgr, annotate=bool(labels), annotate_names=bool(names)
+            bgr, p2_lines_list, annotate=bool(labels), annotate_names=bool(names)
         )
     except Exception as e:
         err = str(e)
@@ -442,8 +490,9 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
 
     try:
         bgr = page2_bgr(pdf_bytes)
-        linderos, vdbg, _vis = detect_rows_and_extract(bgr, annotate=False)
-        owners_detected = [o["owner"] for o in vdbg["rows"] if o.get("owner")]
+        p2_lines_list = page2_lines(pdf_bytes)
+        linderos, vdbg, _vis = detect_rows_and_extract(bgr, p2_lines_list, annotate=False)
+        owners_detected = [l for l in linderos.values() if l]
         owners_detected = list(dict.fromkeys(owners_detected))[:8]
 
         note = None
@@ -451,6 +500,8 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note = "No se pudo determinar lado/vecino con suficiente confianza."
 
         dbg = vdbg if debug else None
+        if debug:
+            dbg["p2_text_sample"] = p2_lines_list[:28]
         return ExtractOut(linderos=linderos, owners_detected=owners_detected, note=note, debug=dbg)
 
     except Exception as e:
@@ -460,4 +511,5 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
