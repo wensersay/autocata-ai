@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.5.7")
+app = FastAPI(title="AutoCatastro AI", version="0.5.8")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -22,7 +22,8 @@ FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
 
 # Segunda línea (cont. del nombre)
-SECOND_LINE_FORCE      = (os.getenv("SECOND_LINE_FORCE", "0").strip() == "1")
+SECOND_LINE_FORCE      = (os.getenv("SECOND_LINE_FORCE", "1").strip() == "1")
+SECOND_LINE_STRICT     = (os.getenv("SECOND_LINE_STRICT","1").strip() == "1")
 SECOND_LINE_MAXTOKENS  = int(os.getenv("SECOND_LINE_MAXTOKENS", "2").strip() or "2")
 SECOND_LINE_MAXCHARS   = int(os.getenv("SECOND_LINE_MAXCHARS",  "26").strip() or "26")
 SHORT_NAME_WHITELIST   = [t.strip().upper() for t in os.getenv(
@@ -64,6 +65,13 @@ GEO_TOKENS = {
 }
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
+
+NOISE_2NDLINE = {"KO","KR","CS","CO","EM","ET","ZO","ZN","CSV","CAT","DIR"}
+
+VOWELS = set("AEIOUÁÉÍÓÚÜ")
+
+def has_vowel(s: str) -> bool:
+    return any(ch in VOWELS for ch in s)
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -195,35 +203,46 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 def clean_second_line(raw: str) -> str:
-    """
-    Permisiva: corta en el primer dígito/ '[' / ':' , limita tokens y caracteres.
-    """
     if not raw: return ""
     s = raw.upper().replace("\n", " ")
-    s = re.split(r"[\[\]:0-9]", s)[0]  # cortar en meta/num
+    s = re.split(r"[\[\]:0-9]", s)[0]                       # cortar en meta/num
     s = re.sub(r"[^A-ZÁÉÍÓÚÜÑ' \-]", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
-    if not s: return ""
+    return s
+
+def validate_second_line(s: str) -> Optional[str]:
+    """
+    Acepta si:
+      - Contiene algún token del WHITELIST (p.ej. LUIS), o
+      - Todos los tokens son alfabéticos, con vocales, y longitud >=3,
+        no en NOISE_2NDLINE/GEO_TOKENS/BAD_TOKENS.
+    Limita a SECOND_LINE_MAXTOKENS y SECOND_LINE_MAXCHARS.
+    """
+    if not s: return None
     toks = [t for t in s.split() if t]
-    # Si hay un nombre claro de whitelist, úsalo tal cual (p.ej. LUIS)
+    # Prioridad: nombre corto whitelisted
     for t in toks:
         if t in SHORT_NAME_WHITELIST:
             return t[:SECOND_LINE_MAXCHARS]
-    # En modo forzado aceptamos hasta N tokens “limpios”
-    toks = toks[:max(1, SECOND_LINE_MAXTOKENS)]
-    s2 = " ".join(toks)[:SECOND_LINE_MAXCHARS].strip()
-    return s2
+
+    ok = []
+    for t in toks:
+        if t in NOISE_2NDLINE: return None
+        if t in GEO_TOKENS or t in BAD_TOKENS: return None
+        if len(t) < 3: return None
+        if not has_vowel(t): return None
+        ok.append(t)
+        if len(ok) >= SECOND_LINE_MAXTOKENS: break
+
+    if not ok: return None
+    cand = " ".join(ok)[:SECOND_LINE_MAXCHARS].strip()
+    return cand if cand else None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Localizar cabecera y banda de la 1ª línea del nombre
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
                                x_text0: int, x_text1: int) -> Tuple[int,int,int,int,dict]:
-    """
-    Devuelve (x0, x1, y0, y1, dbg) para la banda de la 1ª línea del titular.
-    Busca 'APELLIDOS' y opcionalmente 'NIF' y sitúa y0 justo debajo.
-    Alto ≈ 3.7% de la página. Si no encuentra, usa fallback con fila.
-    """
     h, w = bgr.shape[:2]
     pad_y = int(h * 0.06)
     y0s = max(0, row_y - pad_y)
@@ -231,7 +250,6 @@ def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
 
     band = bgr[y0s:y1s, x_text0:x_text1]
     if band.size == 0:
-        # fallback
         y0 = max(0, row_y - int(h*0.01))
         y1 = min(h, y0 + int(h*0.037))
         return x_text0, int(x_text0 + 0.55*(x_text1-x_text0)), y0, y1, {"header_found": False, "x_nif_found": False}
@@ -261,17 +279,14 @@ def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
                 x_nif_found = True
                 x_nif_local = lx
                 header_bottom = max(header_bottom or 0, ty + hh)
-
         if header_bottom is not None:
             break
 
     if header_bottom is None:
-        # fallback si no hay cabecera reconocible
         y0 = max(0, row_y - int(h*0.01))
         y1 = min(h, y0 + int(h*0.037))
         return x_text0, int(x_text0 + 0.55*(x_text1-x_text0)), y0, y1, {"header_found": False, "x_nif_found": False}
 
-    # Coordenadas absolutas
     y0 = y0s + header_bottom + 6
     y1 = min(h, y0 + int(h * 0.037))
     if x_nif_found and x_nif_local is not None:
@@ -282,34 +297,26 @@ def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
         x1 = int(x_text0 + 0.55*(x_text1-x_text0))
 
     if x1 - x0 < max(60, int(w*0.1)):
-        # seguridad: ancho mínimo razonable
         x1 = min(x_text1, x0 + max(60, int(w*0.18)))
 
     dbg = {"header_found": header_found, "x_nif_found": x_nif_found}
     return x0, x1, y0, y1, dbg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Extraer dueño por fila (con 2ª línea robusta)
+# Extraer dueño por fila (con 2ª línea robusta y validada)
 # ──────────────────────────────────────────────────────────────────────────────
 def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
-    """
-    Devuelve (owner_full, dbg)
-      - Primera línea: OCR con whitelist + filtrado de ruido
-      - Segunda línea: barrido vertical + multi-PSM y limpieza permisiva
-    """
     h, w = bgr.shape[:2]
-    # Columna de texto: arrancamos un poco antes para evitar “mordidas”
     x_text0_base = int(w * 0.31)
     x_text1 = int(w * 0.96)
 
-    # Encontrar cabecera
     x0, x1, y1_0, y1_1, hdr_dbg = find_header_and_owner_band(bgr, row_y, x_text0_base, x_text1)
-    band_dbg = {}
 
     # Primera línea (L1)
     roi1 = bgr[y1_0:y1_1, x0:x1]
     name1 = ""
     t1_raw = ""
+    t1_extra_raw = ""
     if roi1.size != 0:
         g1 = cv2.cvtColor(roi1, cv2.COLOR_BGR2GRAY)
         g1 = cv2.resize(g1, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
@@ -323,21 +330,34 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
             ocr_text(bwi1, psm=7,  whitelist=WL),
             ocr_text(bw1,  psm=13, whitelist=WL),
         ]
-        # Elegir la mejor por “score” (letras A–Z)
         best = max(variants, key=lambda t: sum(ch.isalpha() for ch in t))
         t1_raw = best or ""
-        name1 = pick_owner_from_text(best)
+        # Si t1 trae varias líneas (caso “JOSE\nLUIS”), priorizamos esa segunda
+        parts = [p.strip() for p in (t1_raw.split("\n")) if p.strip()]
+        if parts:
+            name1 = pick_owner_from_text(parts[0])
+            if len(parts) >= 2:
+                t1_extra_raw = parts[1]
 
-    # Segunda línea (L2): bajo L1
-    line_h = (y1_1 - y1_0)
-    y2_0 = min(h, y1_1 + 6)
-    y2_1 = min(h, y2_0 + max(14, line_h))
-    t2_raw = ""
-    used_second = False
+    # Intento #0 para 2ª línea: aprovechar L1 si traía salto
+    second_used = False
     second_reason = ""
+    t2_raw = ""
+    cand2_from_t1 = None
+    if SECOND_LINE_FORCE and t1_extra_raw:
+        raw2 = clean_second_line(t1_extra_raw)
+        cand2_from_t1 = validate_second_line(raw2)
+        if cand2_from_t1:
+            second_used = True
+            second_reason = "from_l1_break"
+            name1 = (name1 + " " + cand2_from_t1).strip()
 
-    if SECOND_LINE_FORCE and x1 - x0 > 10:
-        # Barrido vertical + multi-PSM (robusto ante desalineación)
+    # Si aún no hemos añadido 2ª línea y está permitido: mirar justo debajo de L1
+    if SECOND_LINE_FORCE and not second_used and (x1 - x0) > 10:
+        line_h = (y1_1 - y1_0)
+        y2_0 = min(h, y1_1 + 6)
+        y2_1 = min(h, y2_0 + max(14, line_h))
+        # Barrido vertical + multi-PSM
         offsets = [0, +int(0.35*line_h), -int(0.25*line_h), +int(0.6*line_h)]
         best_txt = ""
         best_score = -1
@@ -360,34 +380,29 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
                     if score > best_score:
                         best_txt = t
                         best_score = score
-            # Salida temprana si capturamos un nombre corto (whitelist)
             if any(tok in best_txt.upper().split() for tok in SHORT_NAME_WHITELIST):
                 break
 
         t2_raw = (best_txt or "").strip()
-        cand2 = clean_second_line(t2_raw)
+        raw2 = clean_second_line(t2_raw)
+        cand2 = validate_second_line(raw2) if SECOND_LINE_STRICT else (raw2[:SECOND_LINE_MAXCHARS] or None)
         if cand2:
-            used_second = True
+            second_used = True
             second_reason = "forced"
-            # Si la 1ª línea es corta y 2ª es clara (p.ej. 'LUIS'), unimos
-            if name1:
-                name1 = (name1 + " " + cand2).strip()
-            else:
-                name1 = cand2
+            name1 = (name1 + " " + cand2).strip()
 
-    # Componer salida
     owner_full = (name1 or "").strip()
-    # Poda general por seguridad
     owner_full = owner_full[:max(26, SECOND_LINE_MAXCHARS + 24)].strip()
 
     dbg = {
-        "band": [x0, y1_0, x1, y2_1],
+        "band": [x0, y1_0, x1, min(h, (y1_1 + 6 + max(14, (y1_1 - y1_0))))],
         "y_line1": [y1_0, y1_1],
-        "y_line2": [y2_0, y2_1],
+        "y_line2_hint": [min(h, y1_1 + 6), min(h, y1_1 + 6 + max(14, (y1_1 - y1_0)))],
         "x0": x0, "x1": x1,
         "t1_raw": t1_raw,
+        "t1_extra_raw": t1_extra_raw,
         "t2_raw": t2_raw,
-        "second_line_used": used_second,
+        "second_line_used": second_used,
         "second_line_reason": second_reason,
         "header_found": hdr_dbg.get("header_found", False),
         "x_nif_found": hdr_dbg.get("x_nif_found", False)
@@ -403,7 +418,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # Zona donde suelen estar los mini-mapas (márgenes conservadores)
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
@@ -423,7 +437,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:6]:
-        # vecino más cercano
         best = None; best_d = 1e9
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
@@ -478,6 +491,7 @@ def health():
         "cv2_flags": {"OTSU": bool(THRESH_OTSU)},
         "second_line": {
             "force": SECOND_LINE_FORCE,
+            "strict": SECOND_LINE_STRICT,
             "max_tokens": SECOND_LINE_MAXTOKENS,
             "max_chars": SECOND_LINE_MAXCHARS,
             "short_whitelist": SHORT_NAME_WHITELIST[:8]
@@ -501,7 +515,7 @@ def preview_get(
         blank = np.zeros((240, 640, 3), np.uint8)
         cv2.putText(blank, f"ERR: {err[:60]}", (10,120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        ok, png = cv2.imencode(".png", blank)
+        ok, png = cv2. imencode(".png", blank)
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
     ok, png = cv2.imencode(".png", vis)
@@ -547,5 +561,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
