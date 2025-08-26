@@ -13,7 +13,7 @@ import pdfplumber
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.5.3")
+app = FastAPI(title="AutoCatastro AI", version="0.5.4")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -119,16 +119,13 @@ def clean_owner_line(line: str) -> str:
         if any(ch.isdigit() for ch in t): break
         if t in GEO_TOKENS or "[" in t or "]" in t: break
         if t in BAD_TOKENS or t in ADDR_TOKENS: continue
-        # descarta tokens demasiado cortos que no sean conectores
-        if len(t) <= 2 and t not in NAME_CONNECTORS: 
+        if len(t) <= 2 and t not in NAME_CONNECTORS:
             continue
         out.append(t)
         if t not in NAME_CONNECTORS:
             non_conn += 1
-            # Limitamos a 3 “tokens de nombre” para evitar colas raras
             if non_conn >= 3:
                 break
-    # compactar conectores iniciales
     compact = []
     for t in out:
         if (not compact) and t in NAME_CONNECTORS:
@@ -150,40 +147,53 @@ def pick_owner_from_text(txt: str) -> str:
             return name
     return ""
 
-# ────────── heurística para 2ª línea (solo si parece “continuación de nombre”) ──────────
+# ────────── 2ª línea: aceptar parte inicial antes de geo/dirección ──────────
 def is_probable_name_continuation(line: str) -> Tuple[bool, dict]:
     dbg = {"reason": "ok"}
-    if not line: 
-        dbg["reason"] = "empty"; 
+    if not line:
+        dbg["reason"] = "empty"
         return False, dbg
+
     # cortar por primer dígito, [, :
     m = re.search(r"[\d\[:]", line)
     if m:
         line = line[:m.start()]
-    toks = _tokens_upper(line)
-    if not toks:
+
+    toks_all = _tokens_upper(line)
+    if not toks_all:
         dbg["reason"] = "no_tokens"
         return False, dbg
-    # no geografía ni abreviaturas de dirección
-    if any(t in GEO_TOKENS or t in ADDR_TOKENS for t in toks):
-        dbg["reason"] = "geo_or_addr_token"
-        return False, dbg
-    # máximo 26 chars
-    line = line.strip()[:26]
-    toks = _tokens_upper(line)
 
-    # Regla de tamaño/forma: 1–2 tokens (3 si lleva DE/DEL/Y)
-    if len(toks) == 1:
-        ok = toks[0] in COMMON_SECOND_NAMES or len(toks[0]) >= 3
+    # Tomar sólo los tokens ANTES de que aparezca un token de geo/dirección
+    lead = []
+    for t in toks_all:
+        if t in GEO_TOKENS or t in ADDR_TOKENS:
+            break
+        lead.append(t)
+
+    if not lead:
+        dbg["reason"] = "only_geo_or_addr"
+        return False, dbg
+
+    # máximo 26 chars sobre el string reconstruido
+    lead_str = " ".join(lead)[:26].strip()
+    lead = _tokens_upper(lead_str)
+
+    if len(lead) == 1:
+        ok = lead[0] in COMMON_SECOND_NAMES or len(lead[0]) >= 3
         dbg["reason"] = "1tok_ok" if ok else "1tok_too_short_or_unknown"
         return ok, dbg
-    if len(toks) == 2:
-        # Ambos alfabéticos y no “ruido” muy corto
-        ok = all(len(t) >= 3 or t in NAME_CONNECTORS for t in toks)
+
+    if len(lead) == 2:
+        ok = (
+            any(t in COMMON_SECOND_NAMES for t in lead) or
+            all(len(t) >= 3 or t in NAME_CONNECTORS for t in lead)
+        )
         dbg["reason"] = "2tok_ok" if ok else "2tok_has_short_noise"
         return ok, dbg
-    if len(toks) == 3 and toks[1] in NAME_CONNECTORS:
-        ok = (len(toks[0]) >= 3 and len(toks[2]) >= 3)
+
+    if len(lead) == 3 and lead[1] in NAME_CONNECTORS:
+        ok = (len(lead[0]) >= 3 and len(lead[2]) >= 3)
         dbg["reason"] = "3tok_connector_ok" if ok else "3tok_connector_short"
         return ok, dbg
 
@@ -254,7 +264,7 @@ def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     return "oeste"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Texto PDF (página 2): dos líneas desde columna (preferente)
+# PDF text helpers (página 2): localizar columna global/por fila
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_words(pdf_bytes: bytes):
     pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
@@ -268,6 +278,24 @@ def page2_words(pdf_bytes: bytes):
         pdf.close()
         return None, None, None
 
+def find_column_global(words) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if not words:
+        return None, None, None
+    x_left = None; x_nif = None; header_bottom = None
+    for w in words:
+        t = (w.get("text") or "").upper()
+        if "APELLIDOS" in t or "NOMBRE" in t or "RAZON" in t or "RAZÓN" in t:
+            x_left = min(x_left, float(w.get("x0",0.0))) if x_left is not None else float(w.get("x0",0.0))
+            header_bottom = max(header_bottom or 0.0, float(w.get("bottom",0.0)))
+        if (w.get("text") or "").upper() == "NIF":
+            x_nif = float(w.get("x0",0.0))
+            header_bottom = max(header_bottom or 0.0, float(w.get("bottom",0.0)))
+    if x_left is None or x_nif is None:
+        return None, None, None
+    x_left  = max(0.0, x_left - 2.0)
+    x_right = max(x_left + 10.0, x_nif - 4.0)
+    return x_left, x_right, header_bottom
+
 def find_column_near_y(words, y_pt: float, y_tol: float = 220.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if not words:
         return None, None, None
@@ -280,11 +308,7 @@ def find_column_near_y(words, y_pt: float, y_tol: float = 220.0) -> Tuple[Option
             if "APELLIDOS" in t or "RAZON" in t or "RAZÓN" in t or "NOMBRE" in t or t == "NIF":
                 cands.append(w)
     if not cands:
-        heads = [w for w in words if (w.get("text") or "").upper() in ("APELLIDOS","NIF")]
-        if not heads:
-            return None, None, None
-        rowy = float(min(heads, key=lambda w: abs(float(w.get("top",0.0))-y_pt)).get("top",0.0))
-        cands = [w for w in words if abs(float(w.get("top",0.0))-rowy) < 30.0]
+        return None, None, None
 
     x_left = None
     x_nif  = None
@@ -299,10 +323,7 @@ def find_column_near_y(words, y_pt: float, y_tol: float = 220.0) -> Tuple[Option
         if t == "NIF":
             x_nif = x0
             header_bottom = max(header_bottom or 0.0, bot)
-    if x_left is None:
-        xs = [float(w.get("x0",0.0)) for w in cands if (w.get("text") or "").upper() != "NIF"]
-        if xs: x_left = min(xs)
-    if x_left is None or x_nif is None or header_bottom is None:
+    if x_left is None or x_nif is None:
         return None, None, None
     x_left  = max(0.0, x_left - 2.0)
     x_right = max(x_left + 10.0, x_nif - 4.0)
@@ -335,13 +356,18 @@ def extract_two_lines_from_pdftext(pdf_bytes: bytes, row_y_px: int, bgr_shape: T
         sx = p.width  / float(img_w)
         sy = p.height / float(img_h)
 
+        # Primero: intento "cerca de y"; si falla, usar cabecera global
         y_pt = row_y_px * sy
         x_left, x_right, header_bottom = find_column_near_y(words, y_pt)
+        near = True
         if x_left is None:
-            return "", "", {"pdftext":"no_header_near_y"}
+            x_left, x_right, header_bottom = find_column_global(words)
+            near = False
+        if x_left is None:
+            return "", "", {"pdftext":"no_header_anywhere"}
 
         line_h = 18.0
-        y1_0 = header_bottom + 4.0
+        y1_0 = header_bottom + 4.0 if near else (y_pt - line_h/2)
         y1_1 = y1_0 + line_h
         w1 = words_in_rect(words, x_left, y1_0, x_right, y1_1)
         txt1 = join_words(w1)
@@ -350,13 +376,14 @@ def extract_two_lines_from_pdftext(pdf_bytes: bytes, row_y_px: int, bgr_shape: T
         y2_1 = y2_0 + line_h
         w2 = words_in_rect(words, x_left, y2_0, x_right, y2_1)
         raw2 = join_words(w2)
-        txt2 = raw2.strip()[:26]  # corte duro por 26
+        txt2 = raw2.strip()[:26]
 
         name1 = pick_owner_from_text(txt1) or clean_owner_line(txt1)
-
         use2, why2 = is_probable_name_continuation(txt2)
         final2 = txt2 if use2 else ""
+
         return (name1 or "").strip(), final2, {
+            "near_header": near,
             "x_left": x_left, "x_right": x_right,
             "header_bottom": header_bottom,
             "line1_rect": [x_left, y1_0, x_right, y1_1],
@@ -365,13 +392,13 @@ def extract_two_lines_from_pdftext(pdf_bytes: bytes, row_y_px: int, bgr_shape: T
             "txt2_raw": raw2,
             "txt2_final": final2,
             "second_line_used": use2,
-            "second_line_reason": why2.get("reason","")
+            "second_line_reason": why2.get("reason",""),
         }
     finally:
         pdf.close()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OCR anclado a cabecera “APELLIDOS” (fallback)
+# OCR anclado a cabecera “APELLIDOS” (fallback con x_right=NIF)
 # ──────────────────────────────────────────────────────────────────────────────
 def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]:
     h, w = bgr.shape[:2]
@@ -395,27 +422,32 @@ def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]
         ws = data.get("width", [])
         hs = data.get("height", [])
         header_bot = None
+        x_ap_left = None
         x_nif = None
         for t,lx,ty,ww,hh in zip(words,xs,ys,ws,hs):
             if not t: continue
             T = t.upper()
             if "APELLIDOS" in T:
                 header_bot = max(header_bot or 0, ty + hh)
+                x_ap_left = lx if x_ap_left is None else min(x_ap_left, lx)
             if T == "NIF":
                 x_nif = lx
                 header_bot = max(header_bot or 0, ty + hh)
-        return header_bot, x_nif
+        return header_bot, x_ap_left, x_nif
 
-    header_bot, x_nif = None, None
+    header_bot, x_ap_left, x_nif = None, None, None
     for im in (bw, bwi):
         data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config="--psm 6 --oem 3")
-        hb, xn = find_header(data)
-        if hb is not None:
-            header_bot, x_nif = hb, xn
+        hb, xa, xn = find_header(data)
+        if hb is not None and (xa is not None or xn is not None):
+            header_bot, x_ap_left, x_nif = hb, xa, xn
             break
 
+    # Si no encontramos cabecera, usar proporciones conservadoras
     if header_bot is None:
         line_px = max(22, int(h * 0.018))
+        x0 = x_text0
+        x1 = int(x_text0 + 0.55*(x_text1 - x_text0))
         y1_0 = y0s + int(0.35*(y1s - y0s))
         y1_1 = y1_0 + line_px
         y2_0 = y1_1 + int(line_px*0.30)
@@ -425,23 +457,26 @@ def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]
         y1_1 = y1_0 + max(22, int(h*0.018))
         y2_0 = y1_1 + max(6, int(h*0.006))
         y2_1 = y2_0 + max(22, int(h*0.018))
+        # x_right = NIF si existe; si no, 55% del ancho de la banda
+        x0 = x_text0 if x_ap_left is None else (x_text0 + max(0, x_ap_left - 2))
+        x1 = (x_text0 + x_nif - 6) if x_nif is not None else int(x_text0 + 0.55*(x_text1 - x_text0))
 
-    def _ocr_roi(x0,y0,x1,y1):
-        roi = bgr[y0:y1, x0:x1]
+    def _ocr_roi(x0_,y0_,x1_,y1_):
+        roi = bgr[y0_:y1_, x0_:x1_]
         if roi.size == 0: return ""
         gg = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gg = cv2.resize(gg, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
         gg = enhance_gray(gg)
         bw2, bwi2 = binarize(gg)
         WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-        for im in (bw2,bwi2):
+        for im2 in (bw2,bwi2):
             for psm in (6,7,13):
-                t = ocr_text(im, psm=psm, whitelist=WL)
+                t = ocr_text(im2, psm=psm, whitelist=WL)
                 if t: return t
         return ""
 
-    t1 = _ocr_roi(x_text0, y1_0, x_text1, y1_1)
-    t2 = _ocr_roi(x_text0, y2_0, x_text1, y2_1)
+    t1 = _ocr_roi(x0, y1_0, x1, y1_1)
+    t2 = _ocr_roi(x0, y2_0, x1, y2_1)
 
     name1 = pick_owner_from_text(t1) or clean_owner_line(t1)
     ok2, why2 = is_probable_name_continuation(t2)
@@ -451,10 +486,12 @@ def ocr_two_lines_anchored(bgr: np.ndarray, row_y: int) -> Tuple[str, str, dict]
         "band":[x_text0,y0s,x_text1,y1s],
         "y_line1":[y1_0,y1_1],
         "y_line2":[y2_0,y2_1],
+        "x0": x0, "x1": x1,
         "t1_raw":t1, "t2_raw":t2,
         "second_line_used": ok2,
         "second_line_reason": why2.get("reason",""),
-        "header_found": header_bot is not None
+        "header_found": header_bot is not None,
+        "x_nif_found": x_nif is not None
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -467,9 +504,19 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
+    # localizar croquis y colores
+    def crop_map(bgr_) -> Tuple[np.ndarray, Tuple[int,int]]:
+        hh, ww = bgr_.shape[:2]
+        top = int(hh * 0.12); bottom = int(hh * 0.92)
+        left = int(ww * 0.06); right = int(ww * 0.40)
+        top = max(0, top); bottom = min(hh, bottom)
+        left = max(0, left); right = min(ww, right)
+        if bottom - top < 100 or right - left < 100:
+            return bgr_, (0,0)
+        return bgr_[top:bottom, left:right], (left, top)
+
     crop, (ox, oy) = crop_map(bgr)
     mg, mp = color_masks(crop)
-
     mains  = contours_centroids(mg, min_area=(360 if FAST_MODE else 240))
     neighs = contours_centroids(mp, min_area=(260 if FAST_MODE else 180))
     if not mains:
@@ -494,7 +541,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and best_d < (w*0.25)**2:
             side = side_of((mcx, mcy), best)
 
-        # Preferente: PDF-text
+        # Preferente: PDF-text (global/near)
         name1_pdf = name2_pdf = ""
         dbg_pdf = {}
         if pdf_bytes is not None:
@@ -504,10 +551,10 @@ def detect_rows_and_extract(bgr: np.ndarray,
             except Exception as e:
                 dbg_pdf = {"pdftext_exception": str(e)}
 
-        # Fallback: OCR
+        # Fallback: OCR con x_right recortado a NIF
         name1, name2 = name1_pdf, name2_pdf
         dbg_ocr = {}
-        if not name1 or not name2:
+        if not name1 or (not name2):
             o1,o2,dbg_ocr = ocr_two_lines_anchored(bgr, row_y=mcy)
             if not name1 and o1: name1 = o1
             if not name2 and o2: name2 = o2
@@ -624,4 +671,5 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
