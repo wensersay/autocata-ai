@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.5.9")
+app = FastAPI(title="AutoCatastro AI", version="0.6.0")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags / entorno
@@ -210,7 +210,7 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar cabecera y extraer línea 1 + línea 2 (parche anti-ruido)
+# Localizar cabecera y extraer línea 1 + línea 2 (parche anti-ruido y L1-break)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_owner_band(bgr: np.ndarray, row_y: int,
                                x_text0: int, x_text1: int) -> Tuple[int,int,int,int]:
@@ -279,10 +279,31 @@ def _clean_second_line_raw(t2_raw: str) -> str:
         return ""
     t2 = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s'\-]", " ", t2_raw.upper()).strip()
     t2 = re.sub(r"\s{2,}", " ", t2)[:26]
-    # descartar tokens concretos y líneas demasiado cortas
     if len(t2) < 3 or t2 in JUNK_2NDLINE:
         return ""
     return t2
+
+def _pick_l1_break_extra(t1_raw: str) -> str:
+    """
+    Si Tesseract mete un salto de línea dentro de L1 (p.ej. '... JOSE\\nLUIS'),
+    intenta devolver el primer token 'humano' de la segunda línea.
+    """
+    if not t1_raw:
+        return ""
+    lines = [l.strip().upper() for l in t1_raw.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return ""
+    # Tomamos la segunda línea y la limpiamos
+    cand = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s'\-]", " ", lines[1]).strip()
+    cand = re.sub(r"\s{2,}", " ", cand)
+    # Nos quedamos con el primer token útil
+    toks = [t for t in cand.split() if t not in BAD_TOKENS and t not in GEO_TOKENS]
+    if not toks:
+        return ""
+    t = toks[0][:26]
+    if len(t) < 2 or t in JUNK_2NDLINE:
+        return ""
+    return t
 
 def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     """
@@ -326,23 +347,31 @@ def extract_owner_from_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
         "x0":x0, "x1":x1, "t1_raw":t1_raw, "t2_raw":t2_raw
     })
 
-    # Línea 1 obligatoria (estricta)
+    # Línea 1 (estricta)
     owner = pick_owner_from_text(t1_raw) or clean_owner_line(t1_raw)
     picked_from = "strict" if owner else "fallback"
 
-    # Posible 2ª línea (parche anti-ruido)
+    # Posible extra por salto dentro de L1 (e.g., '\nLUIS')
+    extra_from_l1break = _pick_l1_break_extra(t1_raw)
+
+    # Posible 2ª línea real (L2) con parche anti-ruido
     t2 = _clean_second_line_raw(t2_raw)
+
+    # Concatenación:
     second_used = False
     second_reason = ""
 
-    # Heurística para concatenar 2ª línea: si t1 rompe (nombre en l1 + continuación en l2)
-    if owner and t2:
+    if owner and extra_from_l1break:
+        owner = (owner + " " + extra_from_l1break).strip()
+        second_used = True
+        second_reason = "from_l1_break"
+    elif owner and t2:
         # si l2 es un único token de 2..12 letras (e.g., LUIS, MARIA), únelo
         tok2 = [t for t in t2.split() if t not in BAD_TOKENS and t not in GEO_TOKENS]
         if len(tok2) == 1 and 2 <= len(tok2[0]) <= 12:
             owner = (owner + " " + tok2[0]).strip()
             second_used = True
-            second_reason = "from_l1_break"
+            second_reason = "from_l2_single_token"
 
     dbg = {"ocr": dbg_ocr, "picked_from": picked_from, "second_line_used": second_used, "second_line_reason": second_reason}
     return owner[:62], dbg
