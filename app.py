@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.0")
+app = FastAPI(title="AutoCatastro AI", version="0.6.1")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -26,8 +26,7 @@ FAST_DPI       = int(os.getenv("FAST_DPI", "340") or "340")
 SLOW_DPI       = int(os.getenv("SLOW_DPI", "500") or "500")
 
 # Direcciones: 8-way vs 4-way + snapping angular opcional
-# DIAG_MODE: "8" (preciso) o "4" (colapsa diagonales a cardinal más cercano)
-DIAG_MODE      = os.getenv("DIAG_MODE", "8").strip() or "8"
+DIAG_MODE      = os.getenv("DIAG_MODE", "8").strip() or "8"  # "8" o "4"
 try:
     _snap = os.getenv("DIAG_SNAP_DEG", "").strip()
     DIAG_SNAP_DEG: Optional[int] = int(_snap) if _snap else None
@@ -68,6 +67,20 @@ GEO_TOKENS = {
     "GALICIA","[LUGO]","[BARCELONA]"
 }
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
+
+# Nombres frecuentes (permite concatenar 2ª línea corta si aparece)
+NAME_HINTS = {
+    "JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","FRANCISCO","CARLOS",
+    "JAVIER","PEDRO","ANGEL","ÁNGEL","MARTA","ANA","ISABEL","PABLO","ALVARO","ÁLVARO",
+    "DAVID","LAURA","SARA","RAFAEL","DANIEL","CRISTINA","ROSA","LUISA","ENRIQUE",
+    "EMILIO","GONZALO","OSCAR","ÓSCAR","FERNANDO","ALFONSO","ANDRES","ANDRÉS"
+}
+_extra = os.getenv("NAME_HINTS_EXTRA","").strip()
+if _extra:
+    for tok in _extra.split(","):
+        t = tok.strip().upper()
+        if t:
+            NAME_HINTS.add(t)
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -134,20 +147,15 @@ def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,in
 # ──────────────────────────────────────────────────────────────────────────────
 # Direcciones 8-way + snapping/colapso opcional
 # ──────────────────────────────────────────────────────────────────────────────
-CARD_ANGLES = {
-    "este": 0.0, "norte": 90.0, "oeste": 180.0, "sur": -90.0
-}
-EIGHT_LABELS = ["este","noreste","norte","noroeste","oeste","suroeste","sur","sureste"]
+CARD_ANGLES = { "este": 0.0, "norte": 90.0, "oeste": 180.0, "sur": -90.0 }
 
 def angle_from_main(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> float:
     cx, cy = main_xy; x, y = pt_xy
     sx, sy = x - cx, y - cy
-    # 0° = Este, 90° = Norte, -90° = Sur, 180°/-180° = Oeste
     return math.degrees(math.atan2(-(sy), sx))
 
 def side_8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> Tuple[str, float]:
     ang = angle_from_main(main_xy, pt_xy)
-    # sectores cada 45°, centrados en E(0), NE(45), N(90)...
     if -22.5 <= ang <= 22.5:   side = "este"
     elif 22.5 < ang <= 67.5:   side = "noreste"
     elif 67.5 < ang <= 112.5:  side = "norte"
@@ -159,22 +167,19 @@ def side_8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> Tuple[str, float]:
     return side, ang
 
 def nearest_cardinal(ang: float) -> str:
-    # Devuelve el cardinal más cercano a "ang"
     best = None; best_d = 1e9
     for k, a in CARD_ANGLES.items():
-        d = abs((ang - a + 180) % 360 - 180)  # distancia circular
+        d = abs((ang - a + 180) % 360 - 180)
         if d < best_d:
             best_d = d; best = k
     return best or "este"
 
 def apply_diag_prefs(side: str, ang: float) -> str:
-    # Snapping angular si se define DIAG_SNAP_DEG
     if DIAG_SNAP_DEG is not None:
         cand = nearest_cardinal(ang)
         d = abs((ang - CARD_ANGLES[cand] + 180) % 360 - 180)
         if d <= float(DIAG_SNAP_DEG):
             side = cand
-    # Colapso forzado a 4 direcciones si se pide
     if DIAG_MODE == "4" and side not in ("norte","sur","este","oeste"):
         side = nearest_cardinal(ang)
     return side
@@ -236,8 +241,20 @@ def pick_owner_from_text(txt: str) -> str:
             return name
     return ""
 
+def strip_leading_singletons(s: str) -> str:
+    """Quita tokens iniciales de 1 carácter (p.ej. 'P ', 'Y ')."""
+    if not s: return s
+    toks = [t for t in re.split(r"\s+", s.strip()) if t]
+    while toks and len(toks[0]) == 1:
+        toks.pop(0)
+    return " ".join(toks)
+
 # Localizar banda bajo “Apellidos…/Razón social”
-def find_owner_band(bgr: np.ndarray, row_y: int, x_left: int, x_right: int) -> Tuple[int,int,int,int]:
+def find_owner_band(bgr: np.ndarray, row_y: int, x_left: int, x_right: int) -> Tuple[int,int,int,int,int,int]:
+    """
+    Devuelve (x0,x1,y0,y1, header_left_abs, x_nif_abs)
+    x0 ahora se alinea con el borde izquierdo del encabezado detectado.
+    """
     h, w = bgr.shape[:2]
     pad_y = int(h * 0.06)
     y0s = max(0, row_y - pad_y)
@@ -246,7 +263,7 @@ def find_owner_band(bgr: np.ndarray, row_y: int, x_left: int, x_right: int) -> T
     band = bgr[y0s:y1s, x_left:x_right]
     if band.size == 0:
         y0 = max(0, row_y - int(h*0.01)); y1 = min(h, y0 + int(h*0.035))
-        return x_left, int(x_left + 0.55*(x_right-x_left)), y0, y1
+        return x_left, int(x_left + 0.55*(x_right-x_left)), y0, y1, -1, -1
 
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = binarize(gray)
@@ -256,34 +273,39 @@ def find_owner_band(bgr: np.ndarray, row_y: int, x_left: int, x_right: int) -> T
         words = data.get("text", []); xs = data.get("left", [])
         ys = data.get("top", []); ws = data.get("width", []); hs = data.get("height", [])
 
-        x_nif = None
+        x_nif_local = None
         header_bottom = None
+        header_left_local = None
 
         for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
             if not t: continue
             T = t.upper()
             if "APELLIDOS" in T or "RAZON" in T or "RAZÓN" in T:
                 header_bottom = max(header_bottom or 0, ty + hh)
+                header_left_local = min(header_left_local, lx) if header_left_local is not None else lx
             if T == "NIF":
-                x_nif = lx
+                x_nif_local = lx
                 header_bottom = max(header_bottom or 0, ty + hh)
 
         if header_bottom is not None:
             y0 = y0s + header_bottom + 6
             y1 = min(h, y0 + int(h * 0.035))
-            if x_nif is not None:
-                x0 = x_left
-                x1 = min(x_right, x_left + x_nif - 8)
+            if x_nif_local is not None:
+                x0 = x_left + (header_left_local - 4 if header_left_local is not None else 0)
+                x0 = max(x_left, x0)
+                x1 = min(x_right, x_left + x_nif_local - 8)
             else:
-                x0 = x_left
-                x1 = int(x_left + 0.55*(x_right-x_left))
+                x0 = x_left + (header_left_local - 4 if header_left_local is not None else 0)
+                x0 = max(x_left, x0)
+                x1 = int(x0 + 0.55*(x_right-x_left))
+
             if x1 - x0 > (x_right - x_left) * 0.22:
-                return x0, x1, y0, y1
+                return x0, x1, y0, y1, (x_left + (header_left_local or 0)), (x_left + (x_nif_local or 0))
 
     # Fallback
     y0 = max(0, row_y - int(h*0.01)); y1 = min(h, y0 + int(h*0.035))
     x0 = x_left; x1 = int(x_left + 0.55*(x_right-x_left))
-    return x0, x1, y0, y1
+    return x0, x1, y0, y1, -1, -1
 
 def extract_owner_for_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     """
@@ -295,7 +317,7 @@ def extract_owner_for_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     x_text1 = int(w * 0.92)
 
     # localizar banda "nombre" (línea 1)
-    x0, x1, y0, y1 = find_owner_band(bgr, row_y, x_text0, x_text1)
+    x0, x1, y0, y1, header_left_abs, x_nif_abs = find_owner_band(bgr, row_y, x_text0, x_text1)
     band_h = max(8, y1 - y0)
 
     # construir dos líneas verticalmente contiguas (l1 y l2)
@@ -315,12 +337,15 @@ def extract_owner_for_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
             ocr_text(bw, 7, WL), ocr_text(bwi, 7, WL),
             ocr_text(bw, 13, WL)
         ]
-        # preferimos la más larga razonable
         cand = max((c or "" for c in candidates), key=lambda s: len(s), default="")
         return cand.strip()
 
     raw1 = read_line(x0, l1_y0, x1, l1_y1)
     raw2 = read_line(x0, l2_y0, x1, l2_y1)
+
+    # quitar ruidos como "P " / "Y " al inicio
+    raw1 = strip_leading_singletons(raw1)
+    raw2 = strip_leading_singletons(raw2)
 
     # si Tesseract partió la 1ª en dos líneas, recupéralo
     extra_from_l1 = ""
@@ -328,16 +353,19 @@ def extract_owner_for_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
         parts = [p.strip() for p in raw1.split("\n") if p.strip()]
         if len(parts) >= 2:
             raw1 = parts[0]
-            extra_from_l1 = parts[1][:26]  # continuación breve
+            extra_from_l1 = parts[1][:26]
 
     # limpiar y decidir
     name1 = pick_owner_from_text(raw1)
-    # para la 2ª línea no aplicamos filtros duros; solo cortes básicos
+
     def sanitize_l2(s: str) -> str:
         s = (s or "").upper()
-        s = re.split(r"[\[\]:0-9]", s)[0]  # corta al primer número, [, ] o :
+        # corta al primer número / [ ] :
+        s = re.split(r"[\[\]:0-9]", s)[0]
         s = re.sub(r"[^A-ZÁÉÍÓÚÜÑ '\-]", " ", s)
         s = re.sub(r"\s{2,}", " ", s).strip()
+        # eliminar tokens iniciales de 1 carácter por si acaso
+        s = strip_leading_singletons(s)
         return s[:26]
 
     name2 = ""
@@ -346,15 +374,16 @@ def extract_owner_for_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
     elif raw2:
         name2 = sanitize_l2(raw2)
 
-    # regla: si la 2ª línea es corta (1–12) y parece ser 2º nombre/apellido, la unimos
-    if name1 and name2 and 1 <= len(name2) <= 12 and UPPER_NAME_RE.match(name2 + " " + name1):
-        full = f"{name1} {name2}".strip()
-    else:
-        # solo añadimos si no parece dirección/geo evidente
-        if name2 and not any(tok in name2 for tok in GEO_TOKENS):
+    # Reglas de concatenación robustas:
+    # - unir solo si name2 tiene ≥3 caracteres o está en NAME_HINTS
+    # - y no contiene tokens geográficos claros
+    if name1:
+        if name2 and (len(name2) >= 3 or name2 in NAME_HINTS) and not any(tok in name2 for tok in GEO_TOKENS):
             full = f"{name1} {name2}".strip()
         else:
             full = name1
+    else:
+        full = name2  # fallback extremo (raro)
 
     dbg = {
         "band":[x0, y0, x1, y1],
@@ -362,7 +391,9 @@ def extract_owner_for_row(bgr: np.ndarray, row_y: int) -> Tuple[str, dict]:
         "y_line2_hint":[l2_y0, l2_y1],
         "x0": x0, "x1": x1,
         "t1_raw": raw1, "t1_extra_raw": extra_from_l1,
-        "t2_raw": raw2
+        "t2_raw": raw2,
+        "header_left_abs": header_left_abs,
+        "x_nif_abs": x_nif_abs
     }
     return full, dbg
 
@@ -396,13 +427,11 @@ def detect_rows_and_extract(bgr: np.ndarray,
     mains_abs.sort(key=lambda t: t[1])  # por Y ascendente (fila 1..4)
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
-    # init linderos 8-way
     linderos = {"norte":"","noreste":"","este":"","sureste":"","sur":"","suroeste":"","oeste":"","noroeste":""}
     used_dirs = set()
     rows_dbg = []
 
     for (mcx, mcy, _a) in mains_abs[:6]:
-        # vecino más cercano
         best = None; best_d = 1e9
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
@@ -533,6 +562,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
 
