@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.2")
+app = FastAPI(title="AutoCatastro AI", version="0.6.4")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -30,7 +30,7 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 FAST_MODE  = (os.getenv("FAST_MODE", "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY", "0").strip() == "1")
 
-# DPI (prioridad: FAST_DPI si FAST_MODE=1, si no PDF_DPI)
+# DPI (prioridad: FAST_DPI si FAST_MODE=1; si no, PDF_DPI)
 FAST_DPI = _get_env_int("FAST_DPI", 340)
 PDF_DPI  = _get_env_int("PDF_DPI", 420)
 
@@ -88,6 +88,22 @@ NAME_HINTS_BASE = [
     "POMBO","VAZQUEZ","VÁZQUEZ"
 ] + NAME_HINTS_EXTRA
 
+HEADER_SHORTHAND_RE = re.compile(
+    r"^(A\s*N\s*RZ?|APELLIDOS(\s+NOMBRE)?\s*/?\s*RAZ[ÓO]N\s+SOCIAL)\b", re.IGNORECASE
+)
+
+def is_single_letter_run(s: str) -> bool:
+    """Detecta secuencias tipo 'A N RZ'/'A N R' (1–2 letras separadas por espacios)."""
+    U = s.strip().upper()
+    return re.fullmatch(r"([A-ZÁÉÍÓÚÜÑ]{1,2}\s+){2,6}[A-ZÁÉÍÓÚÜÑ]{1,2}", U) is not None
+
+def strip_header_noise(s: str) -> str:
+    U = s.strip()
+    U = HEADER_SHORTHAND_RE.sub("", U).strip()
+    if is_single_letter_run(U):
+        return ""
+    return U
+
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
         r = requests.get(url, timeout=60)
@@ -144,7 +160,7 @@ def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,in
     out: List[Tuple[int,int,int]] = []
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < min_area: 
+        if a < min_area:
             continue
         M = cv2.moments(c)
         if M["m00"] == 0:
@@ -165,7 +181,6 @@ def side_of8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
     ang = math.degrees(math.atan2(-(sy), sx))  # 0=E, 90=N
-    # sector de 45º
     if -22.5 <= ang < 22.5:    return "este"
     if 22.5 <= ang < 67.5:     return "noreste"
     if 67.5 <= ang < 112.5:    return "norte"
@@ -209,10 +224,8 @@ def clean_owner_line(line: str) -> str:
         if t in GEO_TOKENS or "[" in t or "]" in t: break
         if t in BAD_TOKENS: continue
         out.append(t)
-        # parar si ya tenemos 4–5 tokens útiles
         if len([x for x in out if x not in NAME_CONNECTORS]) >= 5:
             break
-    # compactar conectores múltiples
     compact = []
     for t in out:
         if (not compact) and t in NAME_CONNECTORS:
@@ -224,7 +237,6 @@ def clean_owner_line(line: str) -> str:
 def sanitize_second_line(s2: str) -> str:
     if not s2: return ""
     U = s2.upper().strip()
-    # cortar en dígitos o corchetes / dos puntos
     U = re.split(r"[\[\]:0-9]", U)[0].strip()
     U = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s\.'\-]", " ", U)
     U = re.sub(r"\s{2,}", " ", U).strip()
@@ -235,59 +247,54 @@ def sanitize_second_line(s2: str) -> str:
     return U[:26]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar banda y leer L1/L2
+# Localizar header en banda y leer L1/L2
 # ──────────────────────────────────────────────────────────────────────────────
-def find_columns_once(bgr: np.ndarray) -> Tuple[int,int]:
-    """
-    Busca 'APELLIDOS' y 'NIF' una sola vez en la página para fijar x0/x1 de la columna.
-    Si no encuentra, usa heurístico por porcentaje.
-    """
-    h, w = bgr.shape[:2]
-    page_g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    bw, bwi = binarize(page_g)
+def _header_bottom_in_band(band_bgr: np.ndarray) -> Optional[int]:
+    """Devuelve y_bottom del encabezado dentro de la banda (coords relativas a la banda)."""
+    if band_bgr is None or band_bgr.size == 0:
+        return None
+    g = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2GRAY)
+    bw, bwi = binarize(g)
+    header_bottom = None
+    found = False
     for im in (bw, bwi):
         data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config="--psm 6 --oem 3")
         words = data.get("text", [])
-        xs = data.get("left", [])
-        ws = data.get("width", [])
-        found_ap = []
-        x_nif = None
-        for t, lx, ww in zip(words, xs, ws):
-            if not t: continue
+        ys = data.get("top", [])
+        hs = data.get("height", [])
+        for t, ty, hh in zip(words, ys, hs):
+            if not t:
+                continue
             T = t.upper()
-            if "APELLIDOS" in T:
-                found_ap.append(lx)
-            if T == "NIF":
-                x_nif = lx
-        if (found_ap and x_nif is not None):
-            x0 = max(0, min(found_ap) - int(0.01*w))
-            x1 = max(x0+10, x_nif - int(0.01*w))
-            return x0, x1
-    # Fallback
-    return int(0.31*w), int(0.61*w)
+            if "APELLIDOS" in T or T == "NIF":
+                found = True
+                yb = ty + hh
+                header_bottom = max(header_bottom or 0, yb)
+    return header_bottom if found else None
 
 def read_owner_two_lines(bgr: np.ndarray, row_y: int, x0: int, x1: int) -> Tuple[str, dict]:
-    """
-    Extrae L1 y L2 de la columna x0..x1 alrededor de row_y.
-    Aplica:
-      - Si L1 contiene salto con un segundo renglón "limpio", se usa (from_l1_break).
-      - Si L2 viene limpia y no es ruido, se concatena (2ndline_ok).
-      - Si L2 es ruido (en JUNK_2NDLINE), se ignora.
-    """
+    """Extrae L1/L2 evitando el encabezado y limpiando shorthands 'A N RZ'."""
     h, w = bgr.shape[:2]
-    line_h = int(h * 0.045)               # altura aproximada por línea
-    band_top = max(0, row_y - int(h*0.055))
-    band_bot = min(h, row_y + int(h*0.055))
+    line_h = int(h * 0.045)
+    band_top = max(0, row_y - int(h*0.065))
+    band_bot = min(h, row_y + int(h*0.065))
     band = bgr[band_top:band_bot, x0:x1]
-    dbg = {"band":[x0, band_top, x1, band_bot]}
-    if band.size == 0:
-        return "", {"band": dbg["band"], "t1_raw":"", "t2_raw":""}
 
-    # L1 (justo alrededor de row_y)
+    dbg = {"band":[x0, band_top, x1, band_bot]}
+
+    # Ajuste por encabezado dentro de la banda
+    hdr_rel = _header_bottom_in_band(band)
+    hdr_abs = band_top + hdr_rel + 2 if hdr_rel is not None else None
+    dbg["header_bottom_abs"] = hdr_abs
+
+    # L1 por debajo del header si existe
     l1_top = max(band_top, row_y - line_h//2)
+    if hdr_abs is not None:
+        l1_top = max(l1_top, hdr_abs)
     l1_bot = min(band_bot, l1_top + line_h)
     l1 = bgr[l1_top:l1_bot, x0:x1]
-    # L2 (debajo de L1)
+
+    # L2 inmediatamente debajo
     l2_top = min(band_bot, l1_bot + 2)
     l2_bot = min(band_bot, l2_top + line_h)
     l2 = bgr[l2_top:l2_bot, x0:x1]
@@ -309,12 +316,11 @@ def read_owner_two_lines(bgr: np.ndarray, row_y: int, x0: int, x1: int) -> Tuple
             ocr_text(bwi, psm=7,  whitelist=WL),
             ocr_text(bw,  psm=13, whitelist=WL),
         ]
-        # mejor línea (más tokens de nombre o hints)
         best = ""
         best_score = -1
         for t in variants:
             U = t.strip().upper()
-            if not U: 
+            if not U:
                 continue
             toks = [x for x in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", U) if x]
             score = sum(1 for x in toks if (x in NAME_HINTS_BASE)) + len([x for x in toks if x not in NAME_CONNECTORS])
@@ -328,30 +334,42 @@ def read_owner_two_lines(bgr: np.ndarray, row_y: int, x0: int, x1: int) -> Tuple
     dbg["t1_raw"] = t1_raw
     dbg["t2_raw"] = t2_raw
 
-    # ¿L1 trae salto interno?
-    if "\n" in t1_raw:
-        parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
+    # Si L1 trae varias líneas (por saltos internos), limpiar encabezado y construir
+    if "\n" in t1_raw or "  " in t1_raw:
+        parts = []
+        for p in re.split(r"[\n]+", t1_raw):
+            p = p.strip()
+            if not p:
+                continue
+            p = strip_header_noise(p)
+            if p:
+                parts.append(p)
+
         if len(parts) >= 2:
             base = clean_owner_line(parts[0])
             cont = sanitize_second_line(parts[1])
             if base and cont:
                 dbg["picked_from"] = "from_l1_break"
-                return (f"{base} {cont}").strip(), dbg
-            elif base:
+                return f"{base} {cont}".strip(), dbg
+            if base:
+                dbg["picked_from"] = "from_l1_first_only"
+                return base, dbg
+        elif len(parts) == 1:
+            base = clean_owner_line(parts[0])
+            if base:
                 dbg["picked_from"] = "from_l1_first_only"
                 return base, dbg
 
-    base = clean_owner_line(t1_raw)
+    # Camino normal: L1 limpio + posible L2
+    base = clean_owner_line(strip_header_noise(t1_raw))
     if not base:
-        # intenta con L2 sola (raro)
-        alt = clean_owner_line(t2_raw)
+        alt = clean_owner_line(strip_header_noise(t2_raw))
         if alt:
             dbg["picked_from"] = "l2_only"
             return alt, dbg
         dbg["picked_from"] = "empty"
         return "", dbg
 
-    # concatenar 2ª línea si es válida y no ruido
     second = sanitize_second_line(t2_raw)
     if second and second not in JUNK_2NDLINE:
         dbg["picked_from"] = "strict"
@@ -385,6 +403,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
     mains_abs.sort(key=lambda t: t[1])
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
+    # Fija columna de nombres una sola vez
     x0_col, x1_col = find_columns_once(bgr)
 
     rows_dbg = []
@@ -402,15 +421,12 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None:
             side = side_of8((mcx, mcy), best)
 
-        # OCR L1/L2 de la columna de texto
         owner, ocr_dbg = read_owner_two_lines(bgr, row_y=mcy, x0=x0_col, x1=x1_col)
 
-        # rellenar linderos (no machacar si ya está ese rumbo)
         if side and owner and (side not in used_sides):
             linderos[side] = owner
             used_sides.add(side)
 
-        # anotaciones
         if annotate:
             cv2.circle(vis, (mcx, mcy), 10, (0,255,0), -1)
             if best is not None:
@@ -500,7 +516,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         bgr = page2_bgr(pdf_bytes)
         linderos, vdbg, _vis = detect_rows_and_extract(bgr, annotate=False)
         owners_detected = [o["owner"] for o in vdbg["rows"] if o.get("owner")]
-        # quitar duplicados pero mantener orden
         owners_detected = list(dict.fromkeys(owners_detected))[:8]
 
         note = None
@@ -517,5 +532,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
