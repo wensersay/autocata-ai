@@ -12,40 +12,42 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.4")
+app = FastAPI(title="AutoCatastro AI", version="0.6.1")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Flags de entorno / seguridad
+# Flags / entorno
 # ──────────────────────────────────────────────────────────────────────────────
-def _get_env_int(name: str, default: int) -> int:
-    v = os.getenv(name, "").strip()
-    if not v:
-        return default
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
+TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
+
+def get_int_env(name: str, default: int) -> int:
     try:
-        return int(v)
+        v = int(os.getenv(name, "").strip() or default)
+        return max(72, min(800, v))
     except Exception:
         return default
 
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
-FAST_MODE  = (os.getenv("FAST_MODE", "1").strip() == "1")
-TEXT_ONLY  = (os.getenv("TEXT_ONLY", "0").strip() == "1")
+def get_dpi() -> int:
+    if FAST_MODE:
+        return get_int_env("FAST_DPI", 340)  # manda en FAST_MODE
+    return get_int_env("PDF_DPI", 420)
 
-# DPI (prioridad: FAST_DPI si FAST_MODE=1; si no, PDF_DPI)
-FAST_DPI = _get_env_int("FAST_DPI", 340)
-PDF_DPI  = _get_env_int("PDF_DPI", 420)
+# Mini-lista de nombres frecuentes + ampliable por ENV
+NAME_HINTS = {
+    "JOSE","LUIS","MARIA","CARMEN","ANA","ANTONIO","JUAN","FRANCISCO",
+    "MANUEL","JAVIER","MIGUEL","RAFAEL","PEDRO","ALVARO","JORGE","MARTA",
+    "ROBERTO","FERNANDO","PABLO","ALFONSO","IGNACIO","DIEGO","LAURA",
+}
+EXTRA = [t.strip().upper() for t in (os.getenv("NAME_HINTS_EXTRA","").split(",")) if t.strip()]
+NAME_HINTS.update(EXTRA)
 
-def _clamp(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
+# Tokens basura para 2ª línea (ENV: JUNK_2NDLINE="Z,VA,EO,SS,KO,KR")
+JUNK_2NDLINE = {t.strip().upper() for t in os.getenv("JUNK_2NDLINE","").split(",") if t.strip()}
 
-def current_dpi() -> int:
-    dpi = FAST_DPI if FAST_MODE else PDF_DPI
-    return _clamp(dpi, 220, 600)
-
-# Ruido típico en 2ª línea (configurable)
-JUNK_2NDLINE = {t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR").split(","))}
-# Pistas de nombres extra (configurable)
-NAME_HINTS_EXTRA = [t.strip().upper() for t in os.getenv("NAME_HINTS_EXTRA", "").split(",") if t.strip()]
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Seguridad
+# ──────────────────────────────────────────────────────────────────────────────
 def check_token(x_autocata_token: str = Header(default="")):
     if AUTH_TOKEN and x_autocata_token != AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -72,37 +74,12 @@ BAD_TOKENS = {
     "SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA",
     "CATASTRAL","TITULARIDAD","PRINCIPAL"
 }
-
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
     "GALICIA","[LUGO]","[BARCELONA]"
 }
-
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
-
-NAME_HINTS_BASE = [
-    "JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","FRANCISCO","JAVIER",
-    "ANA","RODRIGUEZ","RODRÍGUEZ","GARCIA","GARCÍA","FERNANDEZ","FERNÁNDEZ",
-    "PEREZ","PÉREZ","LOPEZ","LÓPEZ","ALVAREZ","ALVÁREZ","VARELA","MOSQUERA",
-    "POMBO","VAZQUEZ","VÁZQUEZ"
-] + NAME_HINTS_EXTRA
-
-HEADER_SHORTHAND_RE = re.compile(
-    r"^(A\s*N\s*RZ?|APELLIDOS(\s+NOMBRE)?\s*/?\s*RAZ[ÓO]N\s+SOCIAL)\b", re.IGNORECASE
-)
-
-def is_single_letter_run(s: str) -> bool:
-    """Detecta secuencias tipo 'A N RZ'/'A N R' (1–2 letras separadas por espacios)."""
-    U = s.strip().upper()
-    return re.fullmatch(r"([A-ZÁÉÍÓÚÜÑ]{1,2}\s+){2,6}[A-ZÁÉÍÓÚÜÑ]{1,2}", U) is not None
-
-def strip_header_noise(s: str) -> str:
-    U = s.strip()
-    U = HEADER_SHORTHAND_RE.sub("", U).strip()
-    if is_single_letter_run(U):
-        return ""
-    return U
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -127,7 +104,7 @@ THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
 # Raster (pág. 2) y masks
 # ──────────────────────────────────────────────────────────────────────────────
 def page2_bgr(pdf_bytes: bytes) -> np.ndarray:
-    dpi = current_dpi()
+    dpi = get_dpi()
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo rasterizar la página 2.")
@@ -145,11 +122,9 @@ def color_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         (np.array([  0, 20, 70], np.uint8), np.array([ 10,255,255], np.uint8)),
     ]
     mg = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in g_ranges:
-        mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
+    for lo, hi in g_ranges: mg = cv2.bitwise_or(mg, cv2.inRange(hsv, lo, hi))
     mp = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in p_ranges:
-        mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
+    for lo, hi in p_ranges: mp = cv2.bitwise_or(mp, cv2.inRange(hsv, lo, hi))
     k3 = np.ones((3,3), np.uint8); k5 = np.ones((5,5), np.uint8)
     mg = cv2.morphologyEx(mg, cv2.MORPH_OPEN, k3); mg = cv2.morphologyEx(mg, cv2.MORPH_CLOSE, k5)
     mp = cv2.morphologyEx(mp, cv2.MORPH_OPEN, k3); mp = cv2.morphologyEx(mp, cv2.MORPH_CLOSE, k5)
@@ -160,35 +135,24 @@ def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,in
     out: List[Tuple[int,int,int]] = []
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < min_area:
-            continue
+        if a < min_area: continue
         M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
+        if M["m00"] == 0: continue
         cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
         out.append((cx, cy, int(a)))
     out.sort(key=lambda x: -x[2])
     return out
 
 # 8 rumbos
-DIR_LABELS = {
-    "norte":"N", "noreste":"NE", "este":"E", "sureste":"SE",
-    "sur":"S", "suroeste":"SO", "oeste":"O", "noroeste":"NO"
-}
-
-def side_of8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
+def side8_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
-    ang = math.degrees(math.atan2(-(sy), sx))  # 0=E, 90=N
-    if -22.5 <= ang < 22.5:    return "este"
-    if 22.5 <= ang < 67.5:     return "noreste"
-    if 67.5 <= ang < 112.5:    return "norte"
-    if 112.5 <= ang < 157.5:   return "noroeste"
-    if ang >= 157.5 or ang < -157.5: return "oeste"
-    if -157.5 <= ang < -112.5: return "suroeste"
-    if -112.5 <= ang < -67.5:  return "sur"
-    return "sureste"
+    ang = (math.degrees(math.atan2(-(sy), sx)) + 360.0) % 360.0  # 0=E, 90=N
+    # centros de bins cada 45º: E=0, NE=45, N=90, ...
+    labels = ["este","noreste","norte","noroeste","oeste","suroeste","sur","sureste"]
+    idx = int(((ang + 22.5) % 360) // 45)
+    return labels[idx]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OCR utils
@@ -232,151 +196,172 @@ def clean_owner_line(line: str) -> str:
             continue
         compact.append(t)
     name = " ".join(compact).strip()
-    return name[:64]
+    return name[:48]
 
-def sanitize_second_line(s2: str) -> str:
-    if not s2: return ""
-    U = s2.upper().strip()
-    U = re.split(r"[\[\]:0-9]", U)[0].strip()
-    U = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s\.'\-]", " ", U)
-    U = re.sub(r"\s{2,}", " ", U).strip()
-    if not U:
-        return ""
-    if U in JUNK_2NDLINE:
-        return ""
-    return U[:26]
+def pick_owner_from_text(txt: str) -> str:
+    if not txt: return ""
+    lines = [l.strip() for l in txt.split("\n") if l.strip()]
+    for l in lines:
+        U = l.upper()
+        if any(tok in U for tok in BAD_TOKENS):
+            continue
+        if sum(ch.isdigit() for ch in U) > 1:
+            continue
+        if not UPPER_NAME_RE.match(U):
+            continue
+        name = clean_owner_line(U)
+        if len(name) >= 6:
+            return name
+    return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar header en banda y leer L1/L2
+# Ubicación de columna (una sola vez por página)
 # ──────────────────────────────────────────────────────────────────────────────
-def _header_bottom_in_band(band_bgr: np.ndarray) -> Optional[int]:
-    """Devuelve y_bottom del encabezado dentro de la banda (coords relativas a la banda)."""
-    if band_bgr is None or band_bgr.size == 0:
-        return None
-    g = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2GRAY)
-    bw, bwi = binarize(g)
-    header_bottom = None
-    found = False
-    for im in (bw, bwi):
-        data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config="--psm 6 --oem 3")
-        words = data.get("text", [])
-        ys = data.get("top", [])
-        hs = data.get("height", [])
-        for t, ty, hh in zip(words, ys, hs):
-            if not t:
-                continue
-            T = t.upper()
-            if "APELLIDOS" in T or T == "NIF":
-                found = True
-                yb = ty + hh
-                header_bottom = max(header_bottom or 0, yb)
-    return header_bottom if found else None
-
-def read_owner_two_lines(bgr: np.ndarray, row_y: int, x0: int, x1: int) -> Tuple[str, dict]:
-    """Extrae L1/L2 evitando el encabezado y limpiando shorthands 'A N RZ'."""
+def find_columns_once(bgr: np.ndarray) -> dict:
     h, w = bgr.shape[:2]
-    line_h = int(h * 0.045)
-    band_top = max(0, row_y - int(h*0.065))
-    band_bot = min(h, row_y + int(h*0.065))
-    band = bgr[band_top:band_bot, x0:x1]
+    x_name0 = int(w * 0.33)
+    x_name1 = int(w * 0.60)
+    header_left = None
+    x_nif = None
 
-    dbg = {"band":[x0, band_top, x1, band_bot]}
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = enhance_gray(gray)
+    bw, bwi = binarize(gray)
 
-    # Ajuste por encabezado dentro de la banda
-    hdr_rel = _header_bottom_in_band(band)
-    hdr_abs = band_top + hdr_rel + 2 if hdr_rel is not None else None
-    dbg["header_bottom_abs"] = hdr_abs
+    for im in (bw, bwi):
+        try:
+            data = pytesseract.image_to_data(
+                im, output_type=pytesseract.Output.DICT, config="--psm 6 --oem 3"
+            )
+        except Exception:
+            continue
 
-    # L1 por debajo del header si existe
-    l1_top = max(band_top, row_y - line_h//2)
-    if hdr_abs is not None:
-        l1_top = max(l1_top, hdr_abs)
-    l1_bot = min(band_bot, l1_top + line_h)
-    l1 = bgr[l1_top:l1_bot, x0:x1]
+        words = data.get("text", [])
+        xs = data.get("left", [])
 
-    # L2 inmediatamente debajo
-    l2_top = min(band_bot, l1_bot + 2)
-    l2_bot = min(band_bot, l2_top + line_h)
-    l2 = bgr[l2_top:l2_bot, x0:x1]
+        for i, t in enumerate(words):
+            if not t: continue
+            T = t.upper()
+            if "APELLIDOS" in T and header_left is None:
+                header_left = int(xs[i])
+            if T == "NIF" and x_nif is None:
+                x_nif = int(xs[i])
 
-    dbg.update({"y_line1":[l1_top, l1_bot], "y_line2_hint":[l2_top, l2_bot], "x0":x0, "x1":x1})
+        if header_left is not None or x_nif is not None:
+            break
 
-    def _ocr_clean(img: np.ndarray) -> str:
-        if img is None or img.size == 0:
-            return ""
+    if header_left is not None:
+        x_name0 = max(0, header_left - 8)
+    if x_nif is not None:
+        x_name1 = max(x_name0 + 40, min(w - 1, x_nif - 8))
+
+    return {
+        "x0": int(x_name0),
+        "x1": int(x_name1),
+        "header_left_abs": int(header_left) if header_left is not None else None,
+        "x_nif_abs": int(x_nif) if x_nif is not None else None,
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Extracción por fila (1ª y 2ª línea)
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_owner_from_row(bgr: np.ndarray, row_y: int, cols: dict) -> Tuple[str, dict]:
+    """
+    Devuelve (owner, dbg)
+    - cols: dict con x0/x1 y marcas (find_columns_once)
+    - Lee 1ª línea + (opcional) 2ª línea; si la 1ª trae salto de línea, usa ese resto.
+    """
+    h, w = bgr.shape[:2]
+    x0, x1 = cols.get("x0", int(w*0.33)), cols.get("x1", int(w*0.60))
+
+    # Altura por línea (escala con la página)
+    line_h = max(22, int(h * 0.035))
+    y1a = max(0, row_y - int(h * 0.01))
+    y1b = min(h, y1a + line_h)
+    y2a = min(h, y1b + 2)
+    y2b = min(h, y2a + line_h)
+
+    # ROI y OCR
+    band1 = bgr[y1a:y1b, x0:x1]
+    band2 = bgr[y2a:y2b, x0:x1]
+
+    def ocr_upper(img: np.ndarray) -> str:
+        if img.size == 0: return ""
         g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        g = cv2.resize(g, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+        g = cv2.resize(g, None, fx=1.25, fy=1.25, interpolation=cv2.INTER_CUBIC)
         g = enhance_gray(g)
         bw, bwi = binarize(g)
         WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
-        variants = [
-            ocr_text(bw,  psm=6,  whitelist=WL),
-            ocr_text(bwi, psm=6,  whitelist=WL),
-            ocr_text(bw,  psm=7,  whitelist=WL),
-            ocr_text(bwi, psm=7,  whitelist=WL),
-            ocr_text(bw,  psm=13, whitelist=WL),
+        txts = [
+            ocr_text(bw, 6, WL),
+            ocr_text(bwi, 6, WL),
+            ocr_text(bw, 7, WL),
+            ocr_text(bwi, 7, WL),
         ]
-        best = ""
-        best_score = -1
-        for t in variants:
-            U = t.strip().upper()
-            if not U:
-                continue
-            toks = [x for x in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", U) if x]
-            score = sum(1 for x in toks if (x in NAME_HINTS_BASE)) + len([x for x in toks if x not in NAME_CONNECTORS])
-            if score > best_score:
-                best = U
-                best_score = score
-        return best
+        # Devolver el más largo (mejor señal)
+        return max(txts, key=lambda s: len(s or "")) if txts else ""
 
-    t1_raw = _ocr_clean(l1)
-    t2_raw = _ocr_clean(l2)
-    dbg["t1_raw"] = t1_raw
-    dbg["t2_raw"] = t2_raw
+    raw1 = ocr_upper(band1) or ""
+    raw2 = ocr_upper(band2) or ""
 
-    # Si L1 trae varias líneas (por saltos internos), limpiar encabezado y construir
-    if "\n" in t1_raw or "  " in t1_raw:
-        parts = []
-        for p in re.split(r"[\n]+", t1_raw):
-            p = p.strip()
-            if not p:
-                continue
-            p = strip_header_noise(p)
-            if p:
-                parts.append(p)
+    # 1) Primera línea: puede venir con salto: "RODRIGUEZ ...\nLUIS"
+    l1_main = raw1
+    l1_extra = ""
+    if "\n" in raw1:
+        parts = [p.strip() for p in raw1.split("\n") if p.strip()]
+        if parts:
+            l1_main = parts[0]
+            if len(parts) > 1:
+                l1_extra = parts[-1]  # lo de abajo en L1
 
-        if len(parts) >= 2:
-            base = clean_owner_line(parts[0])
-            cont = sanitize_second_line(parts[1])
-            if base and cont:
-                dbg["picked_from"] = "from_l1_break"
-                return f"{base} {cont}".strip(), dbg
-            if base:
-                dbg["picked_from"] = "from_l1_first_only"
-                return base, dbg
-        elif len(parts) == 1:
-            base = clean_owner_line(parts[0])
-            if base:
-                dbg["picked_from"] = "from_l1_first_only"
-                return base, dbg
+    first = clean_owner_line(l1_main.upper())
+    picked_from = "strict"
 
-    # Camino normal: L1 limpio + posible L2
-    base = clean_owner_line(strip_header_noise(t1_raw))
-    if not base:
-        alt = clean_owner_line(strip_header_noise(t2_raw))
-        if alt:
-            dbg["picked_from"] = "l2_only"
-            return alt, dbg
-        dbg["picked_from"] = "empty"
-        return "", dbg
+    # 2) Decidir segunda línea (preferencia: extra de L1; si no, L2)
+    second_raw = ""
+    if l1_extra:
+        second_raw = l1_extra
+        picked_from = "from_l1_break"
+    elif raw2:
+        second_raw = raw2
 
-    second = sanitize_second_line(t2_raw)
-    if second and second not in JUNK_2NDLINE:
-        dbg["picked_from"] = "strict"
-        return f"{base} {second}".strip(), dbg
+    def accept_second(s: str) -> str:
+        s = (s or "").upper().strip()
+        if not s: return ""
+        # parar en números o corchetes/dos puntos
+        s = re.split(r"[\[\]:0-9]", s)[0].strip()
+        if not s: return ""
+        s = re.sub(r"[^\wÁÉÍÓÚÜÑ' -]+","", s).strip()
+        # tokens muy cortos o en lista basura fuera
+        if s in JUNK_2NDLINE: return ""
+        if len(s) > 26: s = s[:26].rstrip()
+        toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", s) if t]
+        if not toks: return ""
+        # si es un único token, mejor que sea pista conocida o >=3 letras
+        if len(toks) == 1 and (toks[0] not in NAME_HINTS and len(toks[0]) < 3):
+            return ""
+        return " ".join(toks)
 
-    dbg["picked_from"] = "strict_no_l2"
-    return base, dbg
+    second = accept_second(second_raw)
+
+    owner = first
+    if second:
+        # Evitar duplicados (p.ej. ya incluido)
+        if second not in first:
+            owner = f"{first} {second}"
+            owner = owner.strip()
+
+    dbg = {
+        "band": [x0, y1a, x1, y2b],
+        "y_line1": [y1a, y1b],
+        "y_line2_hint": [y2a, y2b],
+        "x0": x0, "x1": x1,
+        "t1_raw": raw1,
+        "t1_extra_raw": l1_extra,
+        "t2_raw": raw2,
+        "picked_from": picked_from,
+    }
+    return owner, dbg
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline por filas
@@ -384,61 +369,64 @@ def read_owner_two_lines(bgr: np.ndarray, row_y: int, x0: int, x1: int) -> Tuple
 def detect_rows_and_extract(bgr: np.ndarray,
                             annotate: bool = False,
                             annotate_names: bool = False) -> Tuple[Dict[str,str], dict, np.ndarray]:
-
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # Región del croquis (izquierda)
+    # zona de mini-mapas
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
     mg, mp = color_masks(crop)
 
-    mains  = contours_centroids(mg, min_area=(320 if FAST_MODE else 240))
+    mains  = contours_centroids(mg, min_area=(300 if FAST_MODE else 220))
     neighs = contours_centroids(mp, min_area=(220 if FAST_MODE else 160))
     if not mains:
-        return {k:"" for k in DIR_LABELS.keys()}, {"rows": [], "raster":{"dpi":current_dpi()}}, vis
+        sides8 = {k:"" for k in ["norte","noreste","este","sureste","sur","suroeste","oeste","noroeste"]}
+        return sides8, {"rows": [], "raster":{"dpi":get_dpi()}}, vis
 
     mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
     mains_abs.sort(key=lambda t: t[1])
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
-    # Fija columna de nombres una sola vez
-    x0_col, x1_col = find_columns_once(bgr)
+    cols = find_columns_once(bgr)
 
     rows_dbg = []
-    linderos = {k:"" for k in DIR_LABELS.keys()}
-    used_sides = set()
+    linderos = {k:"" for k in ["norte","noreste","este","sureste","sur","suroeste","oeste","noroeste"]}
+    used = set()
 
     for (mcx, mcy, _a) in mains_abs[:6]:
-        # vecino más cercano
-        best = None; best_d = 1e12
+        best = None; best_d = 1e9
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
             if d < best_d:
                 best_d = d; best = (nx, ny)
         side = ""
-        if best is not None:
-            side = side_of8((mcx, mcy), best)
+        if best is not None and best_d < (w*0.30)**2:
+            side = side8_of((mcx, mcy), best)
 
-        owner, ocr_dbg = read_owner_two_lines(bgr, row_y=mcy, x0=x0_col, x1=x1_col)
+        owner, odbg = extract_owner_from_row(bgr, row_y=mcy, cols=cols)
 
-        if side and owner and (side not in used_sides):
+        if side and owner and side not in used:
             linderos[side] = owner
-            used_sides.add(side)
+            used.add(side)
 
         if annotate:
             cv2.circle(vis, (mcx, mcy), 10, (0,255,0), -1)
             if best is not None:
                 cv2.circle(vis, best, 8, (0,0,255), -1)
-                lbl = DIR_LABELS.get(side,"")
+                lbl_map = {
+                    "norte":"N","noreste":"NE","este":"E","sureste":"SE",
+                    "sur":"S","suroeste":"SW","oeste":"W","noroeste":"NW"
+                }
+                lbl = lbl_map.get(side,"")
                 if lbl:
                     cv2.putText(vis, lbl, (best[0]-8, best[1]-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
         if annotate_names and owner:
-            cv2.putText(vis, owner[:28], (int(w*0.42), mcy),
+            x_tx = int(w*0.42)
+            cv2.putText(vis, owner[:28], (x_tx, mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
-            cv2.putText(vis, owner[:28], (int(w*0.42), mcy),
+            cv2.putText(vis, owner[:28], (x_tx, mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
 
         rows_dbg.append({
@@ -447,10 +435,12 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "neigh_center": list(best) if best is not None else None,
             "side": side,
             "owner": owner,
-            "ocr": ocr_dbg
+            "ocr": odbg,
+            "header_left_abs": cols.get("header_left_abs"),
+            "x_nif_abs": cols.get("x_nif_abs"),
         })
 
-    dbg = {"rows": rows_dbg, "raster": {"dpi": current_dpi()}}
+    dbg = {"rows": rows_dbg, "raster":{"dpi":get_dpi()}}
     return linderos, dbg, vis
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -463,17 +453,16 @@ def health():
         "version": app.version,
         "FAST_MODE": FAST_MODE,
         "TEXT_ONLY": TEXT_ONLY,
-        "pdf_dpi": PDF_DPI,
-        "fast_dpi": FAST_DPI,
-        "effective_dpi": current_dpi(),
-        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
+        "FAST_DPI": get_int_env("FAST_DPI", 340),
+        "PDF_DPI": get_int_env("PDF_DPI", 420),
+        "cv2_flags": {"OTSU": bool(THRESH_OTSU)},
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
 def preview_get(
     pdf_url: AnyHttpUrl = Query(...),
-    labels: int = Query(0, description="1=mostrar rumbos N/NE/E/..."),
-    names: int = Query(0, description="1=mostrar nombre estimado")
+    labels: int = Query(0, description="1=mostrar rumbos (N/NE/E/...)"),
+    names:  int = Query(0, description="1=mostrar nombre abreviado")
 ):
     pdf_bytes = fetch_pdf_bytes(str(pdf_url))
     try:
@@ -484,8 +473,8 @@ def preview_get(
     except Exception as e:
         err = str(e)
         blank = np.zeros((260, 900, 3), np.uint8)
-        cv2.putText(blank, f"ERR: {err[:120]}", (10,130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        cv2.putText(blank, f"ERR: {err[:80]}", (10,130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
         ok, png = cv2.imencode(".png", blank)
         return StreamingResponse(io.BytesIO(png.tobytes()), media_type="image/png")
 
@@ -506,7 +495,7 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
 
     if TEXT_ONLY:
         return ExtractOut(
-            linderos={k:"" for k in DIR_LABELS.keys()},
+            linderos={k:"" for k in ["norte","noreste","este","sureste","sur","suroeste","oeste","noroeste"]},
             owners_detected=[],
             note="Modo TEXT_ONLY activo: mapa/OCR desactivados.",
             debug={"TEXT_ONLY": True} if debug else None
@@ -527,11 +516,10 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
 
     except Exception as e:
         return ExtractOut(
-            linderos={k:"" for k in DIR_LABELS.keys()},
+            linderos={k:"" for k in ["norte","noreste","este","sureste","sur","suroeste","oeste","noroeste"]},
             owners_detected=[],
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
 
