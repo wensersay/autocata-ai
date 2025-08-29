@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-ARG CACHEBUST=2025-08-19d
+ARG CACHEBUST=2025-09-01a
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
