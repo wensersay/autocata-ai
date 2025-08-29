@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.1")
+app = FastAPI(title="AutoCatastro AI", version="0.6.0")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -33,8 +33,6 @@ JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,
 # Reordenador Nombre(s) + Apellidos
 REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "0").strip() == "1"
 REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
-
-# Hints de nombres (fichero + ENV)
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
 
@@ -73,12 +71,12 @@ BAD_TOKENS = {
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
-    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo: se filtran si son colas con dirección
+    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo: estos se filtran si son colas con dirección
 }
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
-# Reordenador: carga de nombres comunes desde fichero + ENV
+# Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
     try:
@@ -96,10 +94,8 @@ def load_name_hints() -> set:
             if t:
                 base.add(t)
     if not base:
-        base |= {
-            "JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
-            "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"
-        }
+        base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
+                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
     return base
 
 NAME_HINTS = load_name_hints()
@@ -552,6 +548,10 @@ def detect_rows_and_extract(bgr: np.ndarray,
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"ok": True, "service": "AutoCatastro AI", "version": app.version}
+
 @app.get("/health")
 def health():
     return {
@@ -568,6 +568,11 @@ def health():
         "name_hints_loaded": len(NAME_HINTS),
         "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
     }
+
+@app.get("/healthz")
+def healthz():
+    # Alias para healthchecks alternativos
+    return health()
 
 @app.get("/preview", dependencies=[Depends(check_token)])
 def preview_get(
@@ -667,5 +672,6 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
