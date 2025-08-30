@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query, Upload
 from pydantic import BaseModel, AnyHttpUrl
 from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
-import requests, io, re, os, math, time
+import requests, io, re, os, math, time, unicodedata
 import numpy as np
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.1")
+app = FastAPI(title="AutoCatastro AI", version="0.6.0")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -28,7 +28,6 @@ AUTO_DPI = (os.getenv("AUTO_DPI", "0").strip() == "1")
 DPI_LADDER = [int(x) for x in re.split(r"[,\s]+", os.getenv("DPI_LADDER", "300,340").strip()) if x]
 
 # 2ª línea: tokens ruidosos a ignorar
-# (si quieres añadir NE,NO,SE,SO,M,LN,LE hazlo vía ENV: JUNK_2NDLINE=Z,VA,EO,SS,KO,KR,NE,NO,SE,SO,M,LN,LE)
 JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR").split(",")) if t.strip()])
 
 # Reordenador Nombre(s) + Apellidos
@@ -77,6 +76,10 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
+def strip_accents(s: str) -> str:
+    # Convierte ÁÉÍÓÚÜÑÇ… → AEIOUUNC (sin diacríticos)
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
 # Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
@@ -87,6 +90,7 @@ def load_name_hints() -> set:
                     t = line.strip().upper()
                     if t:
                         base.add(t)
+                        base.add(strip_accents(t))  # también guarda la variante sin acentos
     except Exception:
         pass
     if NAME_HINTS_EXTRA:
@@ -94,6 +98,7 @@ def load_name_hints() -> set:
             t = t.strip()
             if t:
                 base.add(t)
+                base.add(strip_accents(t))      # también sin acentos
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
                  "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
@@ -286,7 +291,6 @@ def strip_after_delims(s: str) -> str:
     m = re.split(r"[\[\]:0-9]", s, maxsplit=1)
     return (m[0] if m else s).strip()
 
-# ─── PATCH #1: limpiar y PODAR letra suelta final ────────────────────────────
 def clean_owner_line(line: str) -> str:
     if not line: return ""
     toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", line.upper()) if t]
@@ -298,15 +302,11 @@ def clean_owner_line(line: str) -> str:
         out.append(t)
         if len([x for x in out if x not in NAME_CONNECTORS]) >= 5:
             break
-    # compactar conectores múltiples
     compact = []
     for t in out:
         if (not compact) and t in NAME_CONNECTORS:
             continue
         compact.append(t)
-    # PODA: si el último token es de 1 letra (ruido tipo "M"), lo quitamos
-    while compact and len(compact[-1]) == 1 and compact[-1] not in NAME_CONNECTORS:
-        compact.pop()
     name = " ".join(compact).strip()
     return name[:48]
 
@@ -425,43 +425,25 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
     dbg["t1_extra_raw"] = t1_extra_raw
     return t1_raw, t2_raw, dbg
 
-# ─── PATCH #2: permitir L1 + extra si extra parece nombre ─────────────────────
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
     """
     Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
+      picked_from in {"strict","from_l1_break","l2_clean"}
     Reglas:
-      1) si t1_raw contiene un nombre válido → strict (pero ver MERGE_L1_PLUS_T1EXTRA)
-      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) y L1 falló → from_l1_break
-      3) si L2 útil (no ruido) → l2_clean
+      1) si t1_raw contiene un nombre válido → strict
+      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
+      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
     """
-    owner1 = clean_owner_line((t1_raw or "").upper())
-
-    # MERGE_L1_PLUS_T1EXTRA: si L1 es válido y t1_extra_raw parece un nombre, añadirlo
-    def looks_like_given(s: str) -> bool:
-        if not s: return False
-        t = s.strip().upper()
-        if any(ch.isdigit() for ch in t): return False
-        if t in JUNK_2NDLINE or t in GEO_TOKENS: return False
-        # 2..14 letras
-        if not re.fullmatch(r"[A-ZÁÉÍÓÚÜÑ]{2,14}", t):
-            return False
-        if t in NAME_HINTS:
-            return True
-        return len(t) >= 3
-
-    if owner1 and len(owner1) >= 6:
-        t1e = (t1_extra_raw or "").strip().upper()
-        if looks_like_given(t1e):
-            merged = f"{owner1} {t1e}".strip()
-            merged = strip_after_delims(merged)[:48]
-            return merged, "l1_plus_extra", True
+    # 1) L1 puro
+    owner1 = clean_owner_line(t1_raw.upper())
+    if len(owner1) >= 6:
         return owner1, "strict", False
 
-    # 2) L1 tenía salto y L1 no fue válido -> usar segunda parte si parece nombre
+    # 2) L1 tenía salto -> usar segunda parte si parece nombre
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
+            # unir si L1 tenía algo
             if owner1 and owner1 not in JUNK_2NDLINE:
                 cand = f"{owner1} {t1e}".strip()
             else:
@@ -687,6 +669,5 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
 
