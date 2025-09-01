@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.1")
+app = FastAPI(title="AutoCatastro AI", version="0.6.0")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -76,6 +76,15 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
+# Núcleo de nombres que SIEMPRE consideraremos “de pila”
+CORE_HINTS = {
+    "JOSE","LUIS","MARIA","JUAN","ANTONIO","MANUEL","MIGUEL","FRANCISCO",
+    "JAVIER","CARLOS","ALEJANDRO","PABLO","FERNANDO","RAFAEL","PEDRO",
+    "DIEGO","ALBERTO","ÁNGEL","ANGEL","MARTA","LAURA","ANA","SOFIA","PAULA",
+    # regionales que ya usas
+    "ROGELIO","DOSINDA"
+}
+
 # Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
@@ -96,6 +105,8 @@ def load_name_hints() -> set:
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
                  "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
+    # Garantiza el núcleo mínimo siempre presente
+    base |= CORE_HINTS
     return base
 
 NAME_HINTS = load_name_hints()
@@ -302,10 +313,6 @@ def clean_owner_line(line: str) -> str:
             continue
         compact.append(t)
     name = " ".join(compact).strip()
-    # elimina token final de 1 carácter (ruido tipo "M", "A"...)
-    if compact and len(compact[-1]) == 1:
-        compact.pop()
-        name = " ".join(compact).strip()
     return name[:48]
 
 def pick_owner_from_text(txt: str) -> str:
@@ -428,19 +435,13 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
     Devuelve (owner, picked_from, second_line_used)
       picked_from in {"strict","from_l1_break","l2_clean"}
     Reglas:
-      1) si t1_raw contiene un nombre válido → strict (+ posible unión con t1_extra_raw si parece nombre)
+      1) si t1_raw contiene un nombre válido → strict
       2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
       3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
     """
-    # 1) L1 puro (y unir extra si procede)
+    # 1) L1 puro
     owner1 = clean_owner_line(t1_raw.upper())
     if len(owner1) >= 6:
-        # Unir extra si parece nombre (para compuestos tipo "JOSE LUIS")
-        if t1_extra_raw:
-            t1e = clean_owner_line(t1_extra_raw.upper())
-            if 2 <= len(t1e) <= 20 and t1e not in JUNK_2NDLINE:
-                if (t1e in NAME_HINTS) or (len(t1e.split()) == 1):
-                    owner1 = f"{owner1} {t1e}".strip()
         return owner1, "strict", False
 
     # 2) L1 tenía salto -> usar segunda parte si parece nombre
