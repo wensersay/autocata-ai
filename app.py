@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.6")
+app = FastAPI(title="AutoCatastro AI", version="0.6.7")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -23,12 +23,12 @@ TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
 
 # DPI / Raster
 FAST_DPI = int(os.getenv("FAST_DPI", "300").strip() or "300")
-PDF_DPI  = int(os.getenv("PDF_DPI",  "300").strip() or "300")
+PDF_DPI  = int(os.getenv("PDF_DPI",  "340").strip() or "340")
 AUTO_DPI = (os.getenv("AUTO_DPI", "1").strip() == "1")
 DPI_LADDER = [int(x) for x in re.split(r"[,\s]+", os.getenv("DPI_LADDER", "300,340").strip()) if x]
 
 # 2ª línea: tokens ruidosos a ignorar
-JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR,JA").split(",")) if t.strip()])
+JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR,JA,A").split(",")) if t.strip()])
 
 # Reordenador Nombre(s) + Apellidos
 REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1").strip() == "1"
@@ -36,11 +36,13 @@ REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
 
-# Emparejado / lado
-ROW_BAND_FRAC = float(os.getenv("ROW_BAND_FRAC", "0.16"))           # altura de banda por fila (relativa H)
-NEIGH_MIN_AREA_HARD = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))  # área mínima para rojos
-SIDE_MAX_DIST_FRAC = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35")) # distancia máxima razonable (relativa W)
-SIDE_REFINE_MODE = os.getenv("SIDE_REFINE_MODE", "histo").strip().lower()  # "histo" | "nearest"
+# Detección de croquis / vecinos
+MAIN_MIN_AREA_HARD   = int(os.getenv("MAIN_MIN_AREA_HARD", "260"))
+NEIGH_MIN_AREA_HARD  = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))
+SIDE_MAX_DIST_FRAC   = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35"))  # distancia máx. main->neigh en fracción del ancho
+ROW_BAND_FRAC        = float(os.getenv("ROW_BAND_FRAC", "0.16"))       # alto de ventana para buscar cabecera (proporción H)
+SIDE_REFINE_MODE     = os.getenv("SIDE_REFINE_MODE", "histo").strip()  # nearest | histo | both
+HIST_REFINE_R_FRAC   = float(os.getenv("HIST_REFINE_R_FRAC", "0.06"))  # radio (fracción del min(H,W)) alrededor del vecino
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autorización
@@ -73,6 +75,7 @@ BAD_TOKENS = {
     "APELLIDOS/NOMBRE/RAZÓN"
 }
 
+# geotokens / ruido que no deben entrar en el nombre
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
@@ -81,6 +84,7 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
+# Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
     try:
@@ -99,7 +103,7 @@ def load_name_hints() -> set:
                 base.add(t)
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
-                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
+                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA","ROGELIO","SERGIO"}
     return base
 
 NAME_HINTS = load_name_hints()
@@ -233,7 +237,7 @@ def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,in
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lado por ángulo (8 direcciones)
+# Lado por ángulo (8 direcciones) + refinado por histograma con selector por ejes
 # ──────────────────────────────────────────────────────────────────────────────
 def side_of_8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
@@ -253,6 +257,26 @@ SIDE2LBL = {
     "norte":"N", "noreste":"NE", "este":"E", "sureste":"SE",
     "sur":"S", "suroeste":"SO", "oeste":"O", "noroeste":"NO"
 }
+
+def pick_side_from_hist(wsum: dict) -> str:
+    """Selector por ejes: primero decide eje vertical/horizontal y luego la dirección."""
+    north_axis = wsum.get("norte",0) + 0.5*(wsum.get("noreste",0)+wsum.get("noroeste",0))
+    south_axis = wsum.get("sur",0)   + 0.5*(wsum.get("sureste",0)+wsum.get("suroeste",0))
+    east_axis  = wsum.get("este",0)  + 0.5*(wsum.get("noreste",0)+wsum.get("sureste",0))
+    west_axis  = wsum.get("oeste",0) + 0.5*(wsum.get("noroeste",0)+wsum.get("suroeste",0))
+
+    vert = max(north_axis, south_axis)
+    hori = max(east_axis,  west_axis)
+
+    if vert >= hori:
+        cand = {k:wsum.get(k,0) for k in ("norte","noreste","noroeste")}
+        return max(cand.items(), key=lambda kv: kv[1])[0]
+    else:
+        if west_axis > east_axis:
+            cand = {k:wsum.get(k,0) for k in ("oeste","noroeste","suroeste")}
+        else:
+            cand = {k:wsum.get(k,0) for k in ("este","noreste","sureste")}
+        return max(cand.items(), key=lambda kv: kv[1])[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OCR utils
@@ -319,11 +343,11 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar columna APELLIDOS/NOMBRE y extraer 1ª + posible 2ª línea
+# Localizar columna “Apellidos…” y extraer 1ª + posible 2ª línea
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,dict]:
     h, w = bgr.shape[:2]
-    win = int(h * 0.14)
+    win = int(h * ROW_BAND_FRAC)
     y0s, y1s = max(0, row_y - win), min(h, row_y + win)
     band = bgr[y0s:y1s, int(w*0.28):int(w*0.80)]
     dbg = {"header_found": False, "x_nif_abs": None, "header_left_abs": None}
@@ -390,6 +414,7 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 
     t1_raw = ocr_roi(roi1)
     t2_raw = ocr_roi(roi2)
+
     t1_extra_raw = ""
     if "\n" in t1_raw:
         parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
@@ -410,7 +435,10 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
-            cand = (f"{t1e} {owner1}".strip() if owner1 and owner1 not in JUNK_2NDLINE else t1e)
+            if owner1 and owner1 not in JUNK_2NDLINE:
+                cand = f"{owner1} {t1e}".strip()
+            else:
+                cand = t1e
             cand = strip_after_delims(cand)[:48]
             if cand:
                 return cand, "l1_plus_extra", True
@@ -419,7 +447,10 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
-            cand = (f"{owner1} {t2}".strip() if owner1 and owner1 not in JUNK_2NDLINE else t2)
+            if owner1 and owner1 not in JUNK_2NDLINE:
+                cand = f"{owner1} {t2}".strip()
+            else:
+                cand = t2
             cand = strip_after_delims(cand)[:48]
             if cand:
                 return cand, "l2_clean", True
@@ -435,15 +466,17 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # Área de croquis a la izquierda
+    # Área aproximada donde viven los croquis a la izquierda
     top = int(h * 0.10); bottom = int(h * 0.92)
     left = int(w * 0.04); right = int(w * 0.42)
     crop = bgr[top:bottom, left:right]
-    ch, cw = crop.shape[:2]
 
-    mg, mp = color_masks(crop)
-    mains  = contours_centroids(mg, min_area=(320 if FAST_MODE else 220))
-    neighs = contours_centroids(mp, min_area=(220 if FAST_MODE else 160))
+    # Máscaras en el recorte (detección de blobs) y en toda la página (refinado)
+    mg_c, mp_c = color_masks(crop)
+    mg_f, mp_f = color_masks(bgr)
+
+    mains  = contours_centroids(mg_c, min_area=(MAIN_MIN_AREA_HARD if not FAST_MODE else MAIN_MIN_AREA_HARD))
+    neighs = contours_centroids(mp_c, min_area=(NEIGH_MIN_AREA_HARD if not FAST_MODE else NEIGH_MIN_AREA_HARD))
 
     linderos8 = {"norte":"","noreste":"","este":"","sureste":"","sur":"","suroeste":"","oeste":"","noroeste":""}
     rows_dbg = []
@@ -452,103 +485,53 @@ def detect_rows_and_extract(bgr: np.ndarray,
         return linderos8, {"rows": [], "note":"no mains"}, vis
 
     mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
-    mains_abs.sort(key=lambda t: t[1])   # de arriba a abajo
+    mains_abs.sort(key=lambda t: t[1])
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
     used_sides = set()
+    dmax2 = (w * SIDE_MAX_DIST_FRAC) ** 2
 
     for (mcx, mcy, _a) in mains_abs[:8]:
-        # (1) Emparejado por banda + área
-        band_half = int(h * ROW_BAND_FRAC * 0.5)
-        y0_band, y1_band = max(0, mcy - band_half), min(h, mcy + band_half)
-
-        cand_neighs = [(nx, ny, na) for (nx, ny, na) in neighs_abs
-                       if y0_band <= ny <= y1_band and na >= NEIGH_MIN_AREA_HARD]
-
-        if cand_neighs:
-            nx, ny, na = max(cand_neighs, key=lambda t: t[2])
-            best = (nx, ny)
-            dist2 = (nx - mcx)**2 + (ny - mcy)**2
-        else:
-            best = None; best_d = 1e9
-            for (nx, ny, na) in neighs_abs:
-                if na < NEIGH_MIN_AREA_HARD:
-                    continue
-                d = (nx - mcx)**2 + (ny - mcy)**2
-                if d < best_d:
-                    best_d = d; best = (nx, ny)
-            dist2 = best_d if best is not None else 1e9
+        # vecino más cercano
+        best = None; best_d = 1e12
+        for (nx, ny, _na) in neighs_abs:
+            d = (nx-mcx)**2 + (ny-mcy)**2
+            if d < best_d:
+                best_d = d; best = (nx, ny)
 
         side = ""
-        if best is not None and dist2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
+        refined_point = None
+        refined_hist = None
+        refined_mode = None
+
+        if best is not None and best_d < dmax2:
             side = side_of_8((mcx, mcy), best)
 
-        refined_pt = None
-        refined_mode = None
-        refined_hist = None
+            if SIDE_REFINE_MODE in ("histo","both"):
+                # Ventana en torno al vecino (en máscara roja full)
+                R = int(min(h, w) * HIST_REFINE_R_FRAC)
+                nx, ny = best
+                x0 = max(0, nx - R); x1 = min(w, nx + R)
+                y0 = max(0, ny - R); y1 = min(h, ny + R)
+                sub = mp_f[y0:y1, x0:x1]
+                wsum = {"norte":0,"noreste":0,"este":0,"sureste":0,"sur":0,"suroeste":0,"oeste":0,"noroeste":0}
+                ys, xs = np.where(sub > 0)
+                # Acumula peso 1/dist para dar más importancia a píxeles cercanos al main
+                for yy, xx in zip(ys, xs):
+                    ax = x0 + int(xx)
+                    ay = y0 + int(yy)
+                    # evitar el área principal verde (no debería haber rojo ahí)
+                    dx, dy = ax - mcx, ay - mcy
+                    dist = math.hypot(dx, dy) + 1e-6
+                    s = side_of_8((mcx, mcy), (ax, ay))
+                    wsum[s] += 1.0 / dist
+                refined_hist = wsum
+                refined_point = (nx, ny)
+                refined_mode = "histo"
+                # Selector por ejes:
+                side = pick_side_from_hist(wsum)
 
-        # (2) REFINO: "histo" (por defecto) o "nearest"
-        y_center_crop = mcy - top
-        y0c = max(0, y_center_crop - band_half)
-        y1c = min(ch, y_center_crop + band_half)
-        mp_row = mp[y0c:y1c, :]  # rojos en banda (coords del crop)
-
-        if mp_row.size > 0 and np.any(mp_row):
-            ys, xs = np.where(mp_row > 0)
-            if len(xs) > 0:
-                xs_abs = xs + left
-                ys_abs = ys + y0c + top
-
-                if SIDE_REFINE_MODE == "nearest":
-                    dx = xs_abs - mcx
-                    dy = ys_abs - mcy
-                    idx = int(np.argmin(dx*dx + dy*dy))
-                    refined_pt = (int(xs_abs[idx]), int(ys_abs[idx]))
-                    d2 = int(dx[idx]*dx[idx] + dy[idx]*dy[idx])
-                    if d2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
-                        side = side_of_8((mcx, mcy), refined_pt)
-                    refined_mode = "nearest"
-                else:
-                    # HISTOGRAMA ANGULAR
-                    # sampleo para evitar exceso de puntos
-                    idxs = np.arange(len(xs_abs))
-                    if len(idxs) > 1000:
-                        idxs = np.random.choice(idxs, 1000, replace=False)
-
-                    bins = ["este","noreste","norte","noroeste","oeste","suroeste","sur","sureste"]
-                    wsum = {b:0.0 for b in bins}
-
-                    for i in idxs:
-                        px = int(xs_abs[i]); py = int(ys_abs[i])
-                        dx = px - mcx; dy = py - mcy
-                        d2 = dx*dx + dy*dy
-                        if d2 == 0: 
-                            continue
-                        # peso por distancia (más cerca, más peso)
-                        weight = 1.0 / math.sqrt(d2)
-                        s = side_of_8((mcx, mcy), (px, py))
-                        wsum[s] += weight
-
-                    # elige el octante con mayor peso total
-                    side_histo = max(wsum.items(), key=lambda kv: kv[1])[0]
-                    refined_hist = wsum
-                    side = side_histo
-                    refined_mode = "histo"
-                    # punto representativo = el más cercano dentro de ese lado (para debug)
-                    best_i = None; best_d2 = 1e18
-                    for i in idxs:
-                        px = int(xs_abs[i]); py = int(ys_abs[i])
-                        s = side_of_8((mcx, mcy), (px, py))
-                        if s != side_histo: 
-                            continue
-                        dx = px - mcx; dy = py - mcy
-                        d2 = dx*dx + dy*dy
-                        if d2 < best_d2:
-                            best_d2 = d2; best_i = i
-                    if best_i is not None:
-                        refined_pt = (int(xs_abs[best_i]), int(ys_abs[best_i]))
-
-        # OCR anclado + fallback
+        # OCR anclado a cabecera + fallback
         x0, x1, y0_l1, y1_l1, header_dbg = find_header_and_cols(bgr, mcy)
         t1_raw, t2_raw, ocr_dbg = read_two_lines(bgr, x0, x1, y0_l1, y1_l1)
         owner, picked_from, used_second = choose_owner_from_lines(t1_raw, t2_raw, ocr_dbg.get("t1_extra_raw",""))
@@ -557,6 +540,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if owner:
             owner = reorder_name_if_confident(owner)
 
+        # Evitar sobrescribir el mismo lado si ya está relleno con un nombre más largo
         if side and owner:
             if side not in used_sides or len(owner) > len(linderos8.get(side,"")):
                 linderos8[side] = owner
@@ -566,31 +550,31 @@ def detect_rows_and_extract(bgr: np.ndarray,
             cv2.circle(vis, (mcx, mcy), 10, (0,255,0), -1)
             if best is not None:
                 cv2.circle(vis, best, 8, (0,0,255), -1)
-            if refined_pt is not None:
-                cv2.circle(vis, refined_pt, 6, (255,0,0), -1)
-            lbl = SIDE2LBL.get(side,"")
-            if lbl:
-                cv2.putText(vis, lbl, (mcx+12, mcy-12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+                lbl = SIDE2LBL.get(side,"")
+                if lbl:
+                    cv2.putText(vis, lbl, (best[0]-10, best[1]-12),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
         if annotate_names and owner:
             cv2.putText(vis, owner[:28], (int(w*0.44), mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
             cv2.putText(vis, owner[:28], (int(w*0.44), mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
 
-        rows_dbg.append({
+        row_dbg = {
             "row_y": mcy,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
-            "refined_point": list(refined_pt) if refined_pt is not None else None,
-            "refined_mode": refined_mode,
-            "refined_hist": refined_hist,
             "side": side,
             "owner": owner,
             "picked_from": picked_from,
             "used_second": used_second,
             "ocr": ocr_dbg | header_dbg
-        })
+        }
+        if refined_point is not None:
+            row_dbg["refined_point"] = list(refined_point)
+            row_dbg["refined_mode"] = refined_mode
+            row_dbg["refined_hist"] = refined_hist
+        rows_dbg.append(row_dbg)
 
     dbg = {"rows": rows_dbg}
     return linderos8, dbg, vis
@@ -612,11 +596,12 @@ def health():
         "REORDER_TO_NOMBRE_APELLIDOS": REORDER_TO_NOMBRE_APELLIDOS,
         "REORDER_MIN_CONF": REORDER_MIN_CONF,
         "name_hints_loaded": len(NAME_HINTS),
-        "cv2_flags": {"OTSU": bool(THRESH_OTSU)},
+        "SIDE_REFINE_MODE": SIDE_REFINE_MODE,
         "ROW_BAND_FRAC": ROW_BAND_FRAC,
-        "NEIGH_MIN_AREA_HARD": NEIGH_MIN_AREA_HARD,
         "SIDE_MAX_DIST_FRAC": SIDE_MAX_DIST_FRAC,
-        "SIDE_REFINE_MODE": SIDE_REFINE_MODE
+        "NEIGH_MIN_AREA_HARD": NEIGH_MIN_AREA_HARD,
+        "HIST_REFINE_R_FRAC": HIST_REFINE_R_FRAC,
+        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
@@ -691,6 +676,9 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             debug={"exception": str(e)} if debug else None
         )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# (Opcional) Carga directa de PDF como archivo (útil para test locales)
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/extract_upload", response_model=ExtractOut, dependencies=[Depends(check_token)])
 async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = await file.read()
@@ -713,5 +701,6 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
