@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.4")
+app = FastAPI(title="AutoCatastro AI", version="0.6.5")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -37,9 +37,10 @@ NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
 
 # Emparejado por fila (parche anti-puntitos)
-ROW_BAND_FRAC = float(os.getenv("ROW_BAND_FRAC", "0.16"))       # ancho relativo de la banda vertical por fila
-NEIGH_MIN_AREA_HARD = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))  # área mínima dura para rojos
-SIDE_MAX_DIST_FRAC = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35")) # distancia máxima razonable (relativa al ancho)
+ROW_BAND_FRAC = float(os.getenv("ROW_BAND_FRAC", "0.16"))         # altura relativa de la banda por fila
+NEIGH_MIN_AREA_HARD = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))# área mínima dura p/rojos
+SIDE_MAX_DIST_FRAC = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35"))# distancia máx razonable (relativa al ancho)
+SIDE_REFINE_NEAREST = (os.getenv("SIDE_REFINE_NEAREST", "1").strip() == "1") # usar punto rojo más cercano
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autorización
@@ -175,11 +176,6 @@ THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
 # Raster (pág. 2) con AutoDPI opcional
 # ──────────────────────────────────────────────────────────────────────────────
 def raster_page2(pdf_bytes: bytes) -> Tuple[np.ndarray, dict]:
-    """
-    Devuelve (bgr, debug_raster)
-    - Usa AUTO_DPI si está activo: prueba la escalera y se queda con el primer render OK.
-    - Si no: usa FAST_DPI si FAST_MODE, si no PDF_DPI.
-    """
     dbg = {"dpi": None, "ladder_used": None}
     use_ladder = AUTO_DPI and DPI_LADDER
     dpis = DPI_LADDER if use_ladder else [FAST_DPI if FAST_MODE else PDF_DPI]
@@ -246,7 +242,6 @@ def side_of_8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
     ang = math.degrees(math.atan2(-(sy), sx))  # 0=Este, 90= Norte
-    # sector de 45° centrado en las direcciones cardinales
     if -22.5 <= ang < 22.5: return "este"
     if 22.5 <= ang < 67.5: return "noreste"
     if 67.5 <= ang < 112.5: return "norte"
@@ -330,13 +325,6 @@ def pick_owner_from_text(txt: str) -> str:
 # (metodología "anclada a cabecera" + fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,dict]:
-    """
-    Busca 'APELLIDOS' y 'NIF' en una ventana vertical alrededor de row_y.
-    Devuelve (x0, x1, y0_l1, y1_l1, dbg)
-      - (x0,x1): rango de columna del nombre (hasta x de 'NIF' si existe)
-      - (y0_l1,y1_l1): primera línea de nombre
-    Si no encuentra cabecera: fallback proporcional.
-    """
     h, w = bgr.shape[:2]
     win = int(h * 0.14)
     y0s, y1s = max(0, row_y - win), min(h, row_y + win)
@@ -383,14 +371,8 @@ def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,d
     return x0, x1, y0_l1, y1_l1, dbg
 
 def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tuple[str,str,dict]:
-    """
-    Lee L1 y L2 (L2 justo debajo de L1). Si Tesseract mete \n dentro de L1,
-    separa t1_raw y t1_extra_raw.
-    """
     h, w = bgr.shape[:2]
-    # ROI L1
     roi1 = bgr[y0_l1:y1_l1, x0:x1]
-    # ROI L2: ventana del mismo alto inmediatamente debajo
     y0_l2 = y1_l1 + 2
     y1_l2 = min(h, y0_l2 + (y1_l1 - y0_l1))
     roi2 = bgr[y0_l2:y1_l2, x0:x1]
@@ -411,7 +393,6 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 
     t1_raw = ocr_roi(roi1)
     t2_raw = ocr_roi(roi2)
-    # Caso: L1 con salto de línea dentro
     t1_extra_raw = ""
     if "\n" in t1_raw:
         parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
@@ -425,20 +406,10 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
     return t1_raw, t2_raw, dbg
 
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
-    """
-    Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","l1_plus_extra","l2_clean"}
-    Reglas:
-      1) si t1_raw contiene un nombre válido → strict
-      2) si t1_extra_raw parece nombre → l1_plus_extra (se antepone a L1)
-      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
-    """
-    # 1) L1 puro
     owner1 = clean_owner_line(t1_raw.upper())
     if len(owner1) >= 6:
         return owner1, "strict", False
 
-    # 2) L1 tenía salto -> usar segunda parte si parece nombre (antepuesta)
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
@@ -447,7 +418,6 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
             if cand:
                 return cand, "l1_plus_extra", True
 
-    # 3) L2 si no es ruido
     if t2_raw:
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
@@ -468,10 +438,11 @@ def detect_rows_and_extract(bgr: np.ndarray,
     vis = bgr.copy()
     h, w = bgr.shape[:2]
 
-    # Área aproximada donde viven los croquis a la izquierda
+    # Área de croquis a la izquierda
     top = int(h * 0.10); bottom = int(h * 0.92)
     left = int(w * 0.04); right = int(w * 0.42)
     crop = bgr[top:bottom, left:right]
+    ch, cw = crop.shape[:2]
 
     mg, mp = color_masks(crop)
     mains  = contours_centroids(mg, min_area=(320 if FAST_MODE else 220))
@@ -490,7 +461,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:8]:
-        # ── (PARCHE) Emparejado por banda + área mínima dura ────────────────
+        # ── (1) Emparejado por banda + área mínima dura ──────────────────────
         band_half = int(h * ROW_BAND_FRAC * 0.5)
         y0_band, y1_band = max(0, mcy - band_half), min(h, mcy + band_half)
 
@@ -498,11 +469,10 @@ def detect_rows_and_extract(bgr: np.ndarray,
                        if y0_band <= ny <= y1_band and na >= NEIGH_MIN_AREA_HARD]
 
         if cand_neighs:
-            nx, ny, na = max(cand_neighs, key=lambda t: t[2])  # el de mayor área en la banda
+            nx, ny, na = max(cand_neighs, key=lambda t: t[2])
             best = (nx, ny)
             dist2 = (nx - mcx)**2 + (ny - mcy)**2
         else:
-            # Fallback: de todo el set, el más cercano con área mínima dura
             best = None; best_d = 1e9
             for (nx, ny, na) in neighs_abs:
                 if na < NEIGH_MIN_AREA_HARD:
@@ -516,6 +486,27 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and dist2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
             side = side_of_8((mcx, mcy), best)
 
+        # ── (2) REFINO OPCIONAL: lado por "punto rojo más cercano" ──────────
+        refined_pt = None
+        if SIDE_REFINE_NEAREST:
+            # banda en coords del crop
+            y_center_crop = mcy - top
+            y0c = max(0, y_center_crop - band_half)
+            y1c = min(ch, y_center_crop + band_half)
+            mp_row = mp[y0c:y1c, :]
+            if mp_row.size > 0 and np.any(mp_row):
+                ys, xs = np.where(mp_row > 0)
+                if len(xs) > 0:
+                    xs_abs = xs + left
+                    ys_abs = ys + y0c + top
+                    dx = xs_abs - mcx
+                    dy = ys_abs - mcy
+                    idx = int(np.argmin(dx*dx + dy*dy))
+                    refined_pt = (int(xs_abs[idx]), int(ys_abs[idx]))
+                    d2 = int(dx[idx]*dx[idx] + dy[idx]*dy[idx])
+                    if d2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
+                        side = side_of_8((mcx, mcy), refined_pt)
+
         # OCR anclado a cabecera + fallback
         x0, x1, y0_l1, y1_l1, header_dbg = find_header_and_cols(bgr, mcy)
         t1_raw, t2_raw, ocr_dbg = read_two_lines(bgr, x0, x1, y0_l1, y1_l1)
@@ -525,7 +516,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if owner:
             owner = reorder_name_if_confident(owner)
 
-        # Evitar sobrescribir el mismo lado si ya está relleno con un nombre más largo
         if side and owner:
             if side not in used_sides or len(owner) > len(linderos8.get(side,"")):
                 linderos8[side] = owner
@@ -535,10 +525,12 @@ def detect_rows_and_extract(bgr: np.ndarray,
             cv2.circle(vis, (mcx, mcy), 10, (0,255,0), -1)
             if best is not None:
                 cv2.circle(vis, best, 8, (0,0,255), -1)
-                lbl = SIDE2LBL.get(side,"")
-                if lbl:
-                    cv2.putText(vis, lbl, (best[0]-10, best[1]-12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+            if refined_pt is not None:
+                cv2.circle(vis, refined_pt, 6, (255,0,0), -1)
+            lbl = SIDE2LBL.get(side,"")
+            if lbl:
+                cv2.putText(vis, lbl, (mcx+12, mcy-12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
         if annotate_names and owner:
             cv2.putText(vis, owner[:28], (int(w*0.44), mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
@@ -549,6 +541,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "row_y": mcy,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
+            "refined_point": list(refined_pt) if refined_pt is not None else None,
             "side": side,
             "owner": owner,
             "picked_from": picked_from,
@@ -579,7 +572,8 @@ def health():
         "cv2_flags": {"OTSU": bool(THRESH_OTSU)},
         "ROW_BAND_FRAC": ROW_BAND_FRAC,
         "NEIGH_MIN_AREA_HARD": NEIGH_MIN_AREA_HARD,
-        "SIDE_MAX_DIST_FRAC": SIDE_MAX_DIST_FRAC
+        "SIDE_MAX_DIST_FRAC": SIDE_MAX_DIST_FRAC,
+        "SIDE_REFINE_NEAREST": SIDE_REFINE_NEAREST
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
@@ -594,7 +588,6 @@ def preview_get(
         _linderos, _dbg, vis = detect_rows_and_extract(
             bgr, annotate=bool(labels), annotate_names=bool(names)
         )
-        # Pintar pequeña leyenda DPI
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
@@ -655,9 +648,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
             debug={"exception": str(e)} if debug else None
         )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# (Opcional) Carga directa de PDF como archivo (útil para test locales)
-# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/extract_upload", response_model=ExtractOut, dependencies=[Depends(check_token)])
 async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False)) -> ExtractOut:
     pdf_bytes = await file.read()
@@ -680,5 +670,4 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
