@@ -31,7 +31,7 @@ DPI_LADDER = [int(x) for x in re.split(r"[,\s]+", os.getenv("DPI_LADDER", "300,3
 JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR").split(",")) if t.strip()])
 
 # Reordenador Nombre(s) + Apellidos
-REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "0").strip() == "1"
+REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1").strip() == "1"
 REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
@@ -115,18 +115,6 @@ def looks_like_org(name: str) -> bool:
 def split_tokens(s: str) -> list:
     return [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", s.upper()) if t]
 
-# NUEVO: quita colas de 1–2 letras que no sean conectores ni nombres de la lista
-def prune_trailing_short(tokens: list) -> list:
-    """Quita del final tokens de 1–2 letras que no sean conectores ni hints de nombre."""
-    i = len(tokens)
-    while i > 0:
-        t = tokens[i-1]
-        if len(t) <= 2 and t not in NAME_CONNECTORS and t not in NAME_HINTS:
-            i -= 1
-            continue
-        break
-    return tokens[:i]
-
 def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
     if not tokens:
         return 0.0, 0
@@ -151,14 +139,8 @@ def reorder_name_if_confident(name: str) -> str:
     if not name or looks_like_org(name):
         return name
     toks = split_tokens(name)
-
-    # NUEVO: ignora colas de 1–2 letras (p.ej. "M", "CL") que estorban la detección
-    toks = prune_trailing_short(toks)
-    if len(toks) < 2:
-        return name
-
     conf, g = confidence_trailing_given(toks)
-    if conf < REORDER_MIN_CONF or g == 0:
+    if conf < REORDER_MIN_CONF or g == 0 or len(toks) < 2:
         return name
     head = toks[:-g]
     tail = toks[-g:]
@@ -320,12 +302,6 @@ def clean_owner_line(line: str) -> str:
             continue
         compact.append(t)
     name = " ".join(compact).strip()
-
-    # NUEVO: quita colas tipo "M", "CL", etc. si no son conectores ni nombres
-    toks2 = prune_trailing_short(compact)
-    if toks2 != compact:
-        name = " ".join(toks2).strip()
-
     return name[:48]
 
 def pick_owner_from_text(txt: str) -> str:
@@ -446,44 +422,43 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
     """
     Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean"}
+      picked_from in {"strict","l1_plus_extra","from_l1_break","l2_clean"}
     Reglas:
-      1) si t1_raw contiene un nombre válido → strict
-      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
-      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
+      1) Construye candidato con L1 y, si existe, añade t1_extra_raw (si parece nombre).
+      2) Si no hay nada útil aún, usa L2 si no es ruido.
     """
-    # 1) L1 puro
+    # 1) Limpia L1
     owner1 = clean_owner_line(t1_raw.upper())
-    if len(owner1) >= 6:
-        return owner1, "strict", False
+    picked_from = "strict"
+    used_second = False
 
-    # 2) L1 tenía salto -> usar segunda parte si parece nombre
+    # Añadir t1_extra_raw (cuando Tesseract mete el 2º nombre en la misma L1)
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
-        if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
-            # unir si L1 tenía algo
+        if t1e and t1e not in JUNK_2NDLINE and len(t1e) <= 26:
             if owner1 and owner1 not in JUNK_2NDLINE:
-                cand = f"{owner1} {t1e}".strip()
+                owner1 = f"{owner1} {t1e}".strip()
             else:
-                cand = t1e
-            cand = strip_after_delims(cand)[:48]
-            if cand:
-                return cand, "from_l1_break", True
+                owner1 = t1e
+            picked_from = "l1_plus_extra"
+            used_second = True
 
-    # 3) L2 si no es ruido
+    # Si ya tenemos un nombre mínimamente largo, devolvemos
+    if len(owner1) >= 6:
+        return owner1, picked_from, used_second
+
+    # 2) L2 si no es ruido
     if t2_raw:
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
-            if owner1 and owner1 not in JUNK_2NDLINE:
-                cand = f"{owner1} {t2}".strip()
-            else:
-                cand = t2
-            cand = strip_after_delims(cand)[:48]
-            if cand:
-                return cand, "l2_clean", True
+            owner2 = f"{owner1} {t2}".strip() if owner1 else t2
+            owner2 = strip_after_delims(owner2)[:48]
+            if owner2:
+                return owner2, "l2_clean", True
 
-    return owner1, "strict", False
+    # Nada mejor
+    return owner1, "strict", used_second
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline por filas (detección de puntos + OCR columna)
@@ -687,4 +662,5 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
