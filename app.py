@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.0")
+app = FastAPI(title="AutoCatastro AI", version="0.6.1")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -35,6 +35,9 @@ REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "0").stri
 REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
+
+# Ruido/iniciales al final del nombre (para recorte de cola)
+JUNK_TAIL_TOKENS = set([t.strip().upper() for t in os.getenv("JUNK_TAIL_TOKENS", "M").split(",") if t.strip()])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autorización
@@ -125,7 +128,7 @@ def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
     given = 0
     while i >= 0:
         t = tokens[i]
-        if t in NAME_HINTS or t in NAME_CONNECTORS or strip_accents(t) in NAME_HINTS:
+        if t in NAME_HINTS or t in NAME_CONNECTORS:
             given += 1
             i -= 1
         else:
@@ -136,19 +139,73 @@ def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
         return 0.95, given
     return 0.80, given
 
+# ── Parche robusto de reordenación ───────────────────────────────────────────
+def _trim_trailing_noise(tokens: List[str]) -> List[str]:
+    out = tokens[:]
+    while out:
+        t = out[-1]
+        # inicial sola (no conector ni nombre) o token basura configurado
+        if (len(t) == 1 and t not in NAME_CONNECTORS and t not in NAME_HINTS) or (t in JUNK_TAIL_TOKENS):
+            out.pop()
+        else:
+            break
+    return out
+
+def _run_given_from_end(tokens: List[str]) -> List[str]:
+    # lee secuencia de nombres (o conectores) desde el final hacia atrás
+    res = []
+    i = len(tokens) - 1
+    while i >= 0:
+        t = tokens[i].upper()
+        if (t in NAME_HINTS) or (strip_accents(t) in NAME_HINTS) or (t in NAME_CONNECTORS):
+            res.append(tokens[i])
+            i -= 1
+        else:
+            break
+    res.reverse()
+    return res
+
+def _run_given_from_start(tokens: List[str]) -> List[str]:
+    res = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].upper()
+        if (t in NAME_HINTS) or (strip_accents(t) in NAME_HINTS) or (t in NAME_CONNECTORS):
+            res.append(tokens[i])
+            i += 1
+        else:
+            break
+    return res
+
 def reorder_name_if_confident(name: str) -> str:
     if not REORDER_TO_NOMBRE_APELLIDOS:
         return name
     if not name or looks_like_org(name):
         return name
+
     toks = split_tokens(name)
-    conf, g = confidence_trailing_given(toks)
-    if conf < REORDER_MIN_CONF or g == 0 or len(toks) < 2:
+    toks = _trim_trailing_noise(toks)
+    if len(toks) < 2:
         return name
-    head = toks[:-g]
-    tail = toks[-g:]
-    reordered = " ".join(tail + head).strip()
+
+    # 1) nombres al final (condición necesaria)
+    tail = _run_given_from_end(toks)
+    if not tail:
+        return name
+
+    # 2) nombres al principio (opcional)
+    head_len = len(_run_given_from_start(toks[:-len(tail)])) if len(tail) < len(toks) else 0
+    head = toks[:head_len]
+    middle = toks[head_len:len(toks)-len(tail)]
+
+    # Confianza: si hay al menos un nombre al final
+    conf = 0.80 if len(tail) >= 1 else 0.0
+    if conf < REORDER_MIN_CONF:
+        return name
+
+    reordered = " ".join(tail + head + middle).strip()
     return reordered[:60]
+# ──────────────────────────────────────────────────────────────────────────────
 
 def fetch_pdf_bytes(url: str) -> bytes:
     try:
@@ -425,40 +482,33 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
     """
     Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
+      picked_from in {"strict","from_l1_break","l2_clean"}
     Reglas:
-      A) Si L1 es válido pero L1_extra parece nombre(s) → combinar "extra + L1" (l1_plus_extra)
-      B) Si L1 no es válido y L1_extra sí → from_l1_break
-      C) Si L2 es útil → l2_clean
-      D) En último caso, devolver L1 (strict)
+      1) si t1_raw contiene un nombre válido → strict
+      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
+      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
     """
-    # Normalizamos entradas
-    owner1 = clean_owner_line((t1_raw or "").upper())
-    extra_clean = clean_owner_line((t1_extra_raw or "").upper())
-    extra_ok = False
-    if extra_clean and extra_clean not in JUNK_2NDLINE:
-        toks = split_tokens(extra_clean)
-        # Aceptamos 1–2 tokens que sean (insensible a tildes) nombres o conectores
-        def is_hint(t: str) -> bool:
-            u = t.upper()
-            return (u in NAME_HINTS) or (strip_accents(u) in NAME_HINTS) or (u in NAME_CONNECTORS)
-        extra_ok = 1 <= len(toks) <= 2 and all(is_hint(t) for t in toks)
+    # 1) L1 puro
+    owner1 = clean_owner_line(t1_raw.upper())
+    if len(owner1) >= 6:
+        return owner1, "strict", False
 
-    # A) L1 válido + extra válido → combinar delante (p.ej. "LUIS RODRIGUEZ ALVAREZ JOSE")
-    # Luego el reordenador moverá "JOSE LUIS" delante si procede.
-    if owner1 and len(owner1) >= 6 and extra_ok:
-        cand = f"{extra_clean} {owner1}".strip()
-        return cand[:48], "l1_plus_extra", True
+    # 2) L1 tenía salto -> usar segunda parte si parece nombre
+    if t1_extra_raw:
+        t1e = clean_owner_line(t1_extra_raw.upper())
+        if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
+            # unir si L1 tenía algo
+            if owner1 and owner1 not in JUNK_2NDLINE:
+                cand = f"{owner1} {t1e}".strip()
+            else:
+                cand = t1e
+            cand = strip_after_delims(cand)[:48]
+            if cand:
+                return cand, "from_l1_break", True
 
-    # B) L1 no válido → probar extra incrustada
-    if (not owner1 or len(owner1) < 6) and extra_ok:
-        cand = strip_after_delims(extra_clean)[:48]
-        if cand:
-            return cand, "from_l1_break", True
-
-    # C) L2 si no es ruido ni geo y longitud razonable
+    # 3) L2 si no es ruido
     if t2_raw:
-        t2 = strip_after_delims((t2_raw or "").upper())
+        t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
             if owner1 and owner1 not in JUNK_2NDLINE:
@@ -469,7 +519,6 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
             if cand:
                 return cand, "l2_clean", True
 
-    # D) Último recurso: L1 tal cual (si tenía algo)
     return owner1, "strict", False
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -674,5 +723,6 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
