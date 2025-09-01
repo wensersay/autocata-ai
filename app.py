@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.0")
+app = FastAPI(title="AutoCatastro AI", version="0.6.1")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -71,7 +71,7 @@ BAD_TOKENS = {
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
-    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo: estos se filtran si son colas con dirección
+    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo: se filtran si son colas con dirección
 }
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
@@ -80,7 +80,7 @@ def strip_accents(s: str) -> str:
     # Convierte ÁÉÍÓÚÜÑÇ… → AEIOUUNC (sin diacríticos)
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
-# Reordenador: carga de nombres comunes
+# Reordenador: carga de nombres comunes (añade variantes con y sin acentos)
 def load_name_hints() -> set:
     base = set()
     try:
@@ -90,7 +90,7 @@ def load_name_hints() -> set:
                     t = line.strip().upper()
                     if t:
                         base.add(t)
-                        base.add(strip_accents(t))  # también guarda la variante sin acentos
+                        base.add(strip_accents(t))  # añade variante sin acentos
     except Exception:
         pass
     if NAME_HINTS_EXTRA:
@@ -98,7 +98,7 @@ def load_name_hints() -> set:
             t = t.strip()
             if t:
                 base.add(t)
-                base.add(strip_accents(t))      # también sin acentos
+                base.add(strip_accents(t))      # añade variante sin acentos
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
                  "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
@@ -128,7 +128,8 @@ def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
     given = 0
     while i >= 0:
         t = tokens[i]
-        if t in NAME_HINTS or t in NAME_CONNECTORS:
+        # comprobamos con y sin acentos gracias a NAME_HINTS ya normalizado
+        if t in NAME_HINTS or t in NAME_CONNECTORS or strip_accents(t) in NAME_HINTS:
             given += 1
             i -= 1
         else:
