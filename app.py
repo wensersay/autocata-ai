@@ -324,13 +324,6 @@ def pick_owner_from_text(txt: str) -> str:
 # (metodología "anclada a cabecera" + fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,dict]:
-    """
-    Busca 'APELLIDOS' y 'NIF' en una ventana vertical alrededor de row_y.
-    Devuelve (x0, x1, y0_l1, y1_l1, dbg)
-      - (x0,x1): rango de columna del nombre (hasta x de 'NIF' si existe)
-      - (y0_l1,y1_l1): primera línea de nombre
-    Si no encuentra cabecera: fallback proporcional.
-    """
     h, w = bgr.shape[:2]
     win = int(h * 0.14)
     y0s, y1s = max(0, row_y - win), min(h, row_y + win)
@@ -377,14 +370,8 @@ def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,d
     return x0, x1, y0_l1, y1_l1, dbg
 
 def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tuple[str,str,dict]:
-    """
-    Lee L1 y L2 (L2 justo debajo de L1). Si Tesseract mete \n dentro de L1,
-    separa t1_raw y t1_extra_raw.
-    """
     h, w = bgr.shape[:2]
-    # ROI L1
     roi1 = bgr[y0_l1:y1_l1, x0:x1]
-    # ROI L2: ventana del mismo alto inmediatamente debajo
     y0_l2 = y1_l1 + 2
     y1_l2 = min(h, y0_l2 + (y1_l1 - y0_l1))
     roi2 = bgr[y0_l2:y1_l2, x0:x1]
@@ -405,7 +392,6 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 
     t1_raw = ocr_roi(roi1)
     t2_raw = ocr_roi(roi2)
-    # Caso: L1 con salto de línea dentro
     t1_extra_raw = ""
     if "\n" in t1_raw:
         parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
@@ -419,16 +405,10 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
     return t1_raw, t2_raw, dbg
 
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
-    """
-    Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
-    """
-    # 1) L1 puro
     owner1 = clean_owner_line(t1_raw.upper())
     if len(owner1) >= 6:
         return owner1, "strict", False
 
-    # 2) L1 tenía salto -> usar segunda parte si parece nombre
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
@@ -440,7 +420,6 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
             if cand:
                 return cand, "l1_plus_extra", True
 
-    # 3) L2 si no es ruido
     if t2_raw:
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
@@ -474,8 +453,8 @@ def detect_rows_and_extract(bgr: np.ndarray,
     # ── UMBRALES DINÁMICOS ─────────────────────────────────────────
     ch, cw = crop.shape[:2]
     crop_area = max(1, ch * cw)
-    min_main  = max(120, int(0.00010 * crop_area))   # antes: 320
-    min_neigh = max( 90, int(0.00007 * crop_area))   # antes: 220/160
+    min_main  = max(120, int(0.00010 * crop_area))
+    min_neigh = max( 90, int(0.00007 * crop_area))
 
     mains  = contours_centroids(mg, min_area=min_main)
     neighs = contours_centroids(mp, min_area=min_neigh)
@@ -517,7 +496,6 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if owner:
             owner = reorder_name_if_confident(owner)
 
-        # Evitar sobrescribir el mismo lado si ya está relleno con un nombre más largo
         if side and owner:
             if side not in used_sides or len(owner) > len(linderos8.get(side,"")):
                 linderos8[side] = owner
@@ -583,7 +561,6 @@ def preview_get(
         _linderos, _dbg, vis = detect_rows_and_extract(
             bgr, annotate=bool(labels), annotate_names=bool(names)
         )
-        # Pintar pequeña leyenda DPI
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
@@ -669,5 +646,6 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
