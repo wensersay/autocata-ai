@@ -94,17 +94,8 @@ def load_name_hints() -> set:
             if t:
                 base.add(t)
     if not base:
-        # Base ampliada con DOSINDA y ROGELIO para tu caso
-        base |= {
-            "JOSE","JOSÉ","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
-            "ALEJANDRO","PABLO","JESUS","JESÚS","FRANCISCO","FERNANDO","ALBERTO",
-            "RODRIGO","DIEGO","DAVID","ÁLVARO","ALVARO","IGNACIO","JON","IKER",
-            "MARC","ORIOL","XAVIER","POL","XOSE","XOSE","XOÁN","XOAN","IKER",
-            "GORKA","AITOR","UNAI","ANDONI","MIKEL","ASIER",
-            "ROGELIO","DOSINDA",  # <- añadidos clave
-            "MARIA","MARÍA","ANA","LAURA","MARTA","SARA","CARMEN","PILAR","LUCÍA","LUCIA",
-            "SOFIA","SOFÍA","ELENA","LORENA","PAULA","ANDREA","NURIA","RAQUEL"
-        }
+        base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
+                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
     return base
 
 NAME_HINTS = load_name_hints()
@@ -311,6 +302,10 @@ def clean_owner_line(line: str) -> str:
             continue
         compact.append(t)
     name = " ".join(compact).strip()
+    # elimina token final de 1 carácter (ruido tipo "M", "A"...)
+    if compact and len(compact[-1]) == 1:
+        compact.pop()
+        name = " ".join(compact).strip()
     return name[:48]
 
 def pick_owner_from_text(txt: str) -> str:
@@ -431,30 +426,29 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
     """
     Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
+      picked_from in {"strict","from_l1_break","l2_clean"}
     Reglas:
-      1) si t1_raw contiene un nombre válido → strict
+      1) si t1_raw contiene un nombre válido → strict (+ posible unión con t1_extra_raw si parece nombre)
       2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
       3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
-      4) si L1 es apellidos y t1_extra_raw es nombre → l1_plus_extra (nombre + apellidos)
     """
-    # 1) L1 puro
+    # 1) L1 puro (y unir extra si procede)
     owner1 = clean_owner_line(t1_raw.upper())
     if len(owner1) >= 6:
+        # Unir extra si parece nombre (para compuestos tipo "JOSE LUIS")
+        if t1_extra_raw:
+            t1e = clean_owner_line(t1_extra_raw.upper())
+            if 2 <= len(t1e) <= 20 and t1e not in JUNK_2NDLINE:
+                if (t1e in NAME_HINTS) or (len(t1e.split()) == 1):
+                    owner1 = f"{owner1} {t1e}".strip()
         return owner1, "strict", False
 
     # 2) L1 tenía salto -> usar segunda parte si parece nombre
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
+            # unir si L1 tenía algo
             if owner1 and owner1 not in JUNK_2NDLINE:
-                # ¿La segunda parte parece nombre (pista)?
-                if t1e in NAME_HINTS:
-                    cand = f"{t1e} {owner1}".strip()  # nombre + apellidos
-                    cand = strip_after_delims(cand)[:48]
-                    if cand:
-                        return cand, "l1_plus_extra", True
-                # si no, concatenamos como continuación
                 cand = f"{owner1} {t1e}".strip()
             else:
                 cand = t1e
@@ -679,4 +673,5 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
