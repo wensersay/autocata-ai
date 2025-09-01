@@ -2,13 +2,12 @@ from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query, Upload
 from pydantic import BaseModel, AnyHttpUrl
 from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
-import requests, io, re, os, math, time
+import requests, io, re, os, math, time, unicodedata
 import numpy as np
 from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
 import pytesseract
-import unicodedata  # ← nuevo (para quitar tildes)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
@@ -77,12 +76,8 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
-# Quitar acentos (para igualar "JOSÉ" con "JOSE")
 def strip_accents(s: str) -> str:
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', s)
-        if unicodedata.category(c) != 'Mn'
-    )
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 # Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
@@ -107,9 +102,6 @@ def load_name_hints() -> set:
     return base
 
 NAME_HINTS = load_name_hints()
-# Añade variantes sin tilde para que JOSE=JOSÉ, ANGEL=ÁNGEL, etc.
-NAME_HINTS = {h for h in NAME_HINTS if h}
-NAME_HINTS |= {strip_accents(h) for h in NAME_HINTS}
 
 ORG_TOKENS = {"S.L","S.A","SL","SA","SLU","SCOOP","S.COOP","SC","CB","SCP","AYUNTAMIENTO",
               "CONCELLO","DIOCESIS","DIOCESÍS","PARROQUIA","IGLESIA","SOCIEDAD","FUNDACION",
@@ -133,7 +125,7 @@ def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
     given = 0
     while i >= 0:
         t = tokens[i]
-        if t in NAME_HINTS or t in NAME_CONNECTORS:
+        if t in NAME_HINTS or t in NAME_CONNECTORS or strip_accents(t) in NAME_HINTS:
             given += 1
             i -= 1
         else:
@@ -435,33 +427,38 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
     Devuelve (owner, picked_from, second_line_used)
       picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
     Reglas:
-      1) si t1_raw contiene un nombre válido → strict
-      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
-      2b) si L1 y extra son válidos, unir como "extra + L1" → l1_plus_extra
-      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
+      A) Si L1 es válido pero L1_extra parece nombre(s) → combinar "extra + L1" (l1_plus_extra)
+      B) Si L1 no es válido y L1_extra sí → from_l1_break
+      C) Si L2 es útil → l2_clean
+      D) En último caso, devolver L1 (strict)
     """
-    # 1) L1 puro
-    owner1 = clean_owner_line(t1_raw.upper())
-    if len(owner1) >= 6:
-        return owner1, "strict", False
+    # Normalizamos entradas
+    owner1 = clean_owner_line((t1_raw or "").upper())
+    extra_clean = clean_owner_line((t1_extra_raw or "").upper())
+    extra_ok = False
+    if extra_clean and extra_clean not in JUNK_2NDLINE:
+        toks = split_tokens(extra_clean)
+        # Aceptamos 1–2 tokens que sean (insensible a tildes) nombres o conectores
+        def is_hint(t: str) -> bool:
+            u = t.upper()
+            return (u in NAME_HINTS) or (strip_accents(u) in NAME_HINTS) or (u in NAME_CONNECTORS)
+        extra_ok = 1 <= len(toks) <= 2 and all(is_hint(t) for t in toks)
 
-    # 2) L1 tenía salto -> usar segunda parte si parece nombre
-    if t1_extra_raw:
-        t1e = clean_owner_line(t1_extra_raw.upper())
-        if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
-            # unir con L1 si L1 tenía algo válido
-            if owner1 and owner1 not in JUNK_2NDLINE:
-                cand = f"{t1e} {owner1}".strip()   # extra delante
-                return cand[:48], "l1_plus_extra", True
-            else:
-                cand = t1e
-                cand = strip_after_delims(cand)[:48]
-                if cand:
-                    return cand, "from_l1_break", True
+    # A) L1 válido + extra válido → combinar delante (p.ej. "LUIS RODRIGUEZ ALVAREZ JOSE")
+    # Luego el reordenador moverá "JOSE LUIS" delante si procede.
+    if owner1 and len(owner1) >= 6 and extra_ok:
+        cand = f"{extra_clean} {owner1}".strip()
+        return cand[:48], "l1_plus_extra", True
 
-    # 3) L2 si no es ruido
+    # B) L1 no válido → probar extra incrustada
+    if (not owner1 or len(owner1) < 6) and extra_ok:
+        cand = strip_after_delims(extra_clean)[:48]
+        if cand:
+            return cand, "from_l1_break", True
+
+    # C) L2 si no es ruido ni geo y longitud razonable
     if t2_raw:
-        t2 = strip_after_delims(t2_raw.upper())
+        t2 = strip_after_delims((t2_raw or "").upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
             if owner1 and owner1 not in JUNK_2NDLINE:
@@ -472,6 +469,7 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
             if cand:
                 return cand, "l2_clean", True
 
+    # D) Último recurso: L1 tal cual (si tenía algo)
     return owner1, "strict", False
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -676,6 +674,5 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
 
