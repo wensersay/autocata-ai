@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.5")
+app = FastAPI(title="AutoCatastro AI", version="0.6.6")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -36,11 +36,11 @@ REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
 
-# Emparejado por fila (parche anti-puntitos)
-ROW_BAND_FRAC = float(os.getenv("ROW_BAND_FRAC", "0.16"))         # altura relativa de la banda por fila
-NEIGH_MIN_AREA_HARD = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))# área mínima dura p/rojos
-SIDE_MAX_DIST_FRAC = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35"))# distancia máx razonable (relativa al ancho)
-SIDE_REFINE_NEAREST = (os.getenv("SIDE_REFINE_NEAREST", "1").strip() == "1") # usar punto rojo más cercano
+# Emparejado / lado
+ROW_BAND_FRAC = float(os.getenv("ROW_BAND_FRAC", "0.16"))           # altura de banda por fila (relativa H)
+NEIGH_MIN_AREA_HARD = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))  # área mínima para rojos
+SIDE_MAX_DIST_FRAC = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35")) # distancia máxima razonable (relativa W)
+SIDE_REFINE_MODE = os.getenv("SIDE_REFINE_MODE", "histo").strip().lower()  # "histo" | "nearest"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autorización
@@ -73,7 +73,6 @@ BAD_TOKENS = {
     "APELLIDOS/NOMBRE/RAZÓN"
 }
 
-# geotokens / ruido que no deben entrar en el nombre
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
@@ -82,7 +81,6 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
-# Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
     try:
@@ -321,8 +319,7 @@ def pick_owner_from_text(txt: str) -> str:
     return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Localizar columna “Apellidos…” y extraer 1ª + posible 2ª línea
-# (metodología "anclada a cabecera" + fallback)
+# Localizar columna APELLIDOS/NOMBRE y extraer 1ª + posible 2ª línea
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,dict]:
     h, w = bgr.shape[:2]
@@ -461,7 +458,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:8]:
-        # ── (1) Emparejado por banda + área mínima dura ──────────────────────
+        # (1) Emparejado por banda + área
         band_half = int(h * ROW_BAND_FRAC * 0.5)
         y0_band, y1_band = max(0, mcy - band_half), min(h, mcy + band_half)
 
@@ -486,19 +483,23 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if best is not None and dist2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
             side = side_of_8((mcx, mcy), best)
 
-        # ── (2) REFINO OPCIONAL: lado por "punto rojo más cercano" ──────────
         refined_pt = None
-        if SIDE_REFINE_NEAREST:
-            # banda en coords del crop
-            y_center_crop = mcy - top
-            y0c = max(0, y_center_crop - band_half)
-            y1c = min(ch, y_center_crop + band_half)
-            mp_row = mp[y0c:y1c, :]
-            if mp_row.size > 0 and np.any(mp_row):
-                ys, xs = np.where(mp_row > 0)
-                if len(xs) > 0:
-                    xs_abs = xs + left
-                    ys_abs = ys + y0c + top
+        refined_mode = None
+        refined_hist = None
+
+        # (2) REFINO: "histo" (por defecto) o "nearest"
+        y_center_crop = mcy - top
+        y0c = max(0, y_center_crop - band_half)
+        y1c = min(ch, y_center_crop + band_half)
+        mp_row = mp[y0c:y1c, :]  # rojos en banda (coords del crop)
+
+        if mp_row.size > 0 and np.any(mp_row):
+            ys, xs = np.where(mp_row > 0)
+            if len(xs) > 0:
+                xs_abs = xs + left
+                ys_abs = ys + y0c + top
+
+                if SIDE_REFINE_MODE == "nearest":
                     dx = xs_abs - mcx
                     dy = ys_abs - mcy
                     idx = int(np.argmin(dx*dx + dy*dy))
@@ -506,8 +507,48 @@ def detect_rows_and_extract(bgr: np.ndarray,
                     d2 = int(dx[idx]*dx[idx] + dy[idx]*dy[idx])
                     if d2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
                         side = side_of_8((mcx, mcy), refined_pt)
+                    refined_mode = "nearest"
+                else:
+                    # HISTOGRAMA ANGULAR
+                    # sampleo para evitar exceso de puntos
+                    idxs = np.arange(len(xs_abs))
+                    if len(idxs) > 1000:
+                        idxs = np.random.choice(idxs, 1000, replace=False)
 
-        # OCR anclado a cabecera + fallback
+                    bins = ["este","noreste","norte","noroeste","oeste","suroeste","sur","sureste"]
+                    wsum = {b:0.0 for b in bins}
+
+                    for i in idxs:
+                        px = int(xs_abs[i]); py = int(ys_abs[i])
+                        dx = px - mcx; dy = py - mcy
+                        d2 = dx*dx + dy*dy
+                        if d2 == 0: 
+                            continue
+                        # peso por distancia (más cerca, más peso)
+                        weight = 1.0 / math.sqrt(d2)
+                        s = side_of_8((mcx, mcy), (px, py))
+                        wsum[s] += weight
+
+                    # elige el octante con mayor peso total
+                    side_histo = max(wsum.items(), key=lambda kv: kv[1])[0]
+                    refined_hist = wsum
+                    side = side_histo
+                    refined_mode = "histo"
+                    # punto representativo = el más cercano dentro de ese lado (para debug)
+                    best_i = None; best_d2 = 1e18
+                    for i in idxs:
+                        px = int(xs_abs[i]); py = int(ys_abs[i])
+                        s = side_of_8((mcx, mcy), (px, py))
+                        if s != side_histo: 
+                            continue
+                        dx = px - mcx; dy = py - mcy
+                        d2 = dx*dx + dy*dy
+                        if d2 < best_d2:
+                            best_d2 = d2; best_i = i
+                    if best_i is not None:
+                        refined_pt = (int(xs_abs[best_i]), int(ys_abs[best_i]))
+
+        # OCR anclado + fallback
         x0, x1, y0_l1, y1_l1, header_dbg = find_header_and_cols(bgr, mcy)
         t1_raw, t2_raw, ocr_dbg = read_two_lines(bgr, x0, x1, y0_l1, y1_l1)
         owner, picked_from, used_second = choose_owner_from_lines(t1_raw, t2_raw, ocr_dbg.get("t1_extra_raw",""))
@@ -542,6 +583,8 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
             "refined_point": list(refined_pt) if refined_pt is not None else None,
+            "refined_mode": refined_mode,
+            "refined_hist": refined_hist,
             "side": side,
             "owner": owner,
             "picked_from": picked_from,
@@ -573,7 +616,7 @@ def health():
         "ROW_BAND_FRAC": ROW_BAND_FRAC,
         "NEIGH_MIN_AREA_HARD": NEIGH_MIN_AREA_HARD,
         "SIDE_MAX_DIST_FRAC": SIDE_MAX_DIST_FRAC,
-        "SIDE_REFINE_NEAREST": SIDE_REFINE_NEAREST
+        "SIDE_REFINE_MODE": SIDE_REFINE_MODE
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
@@ -670,4 +713,5 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
