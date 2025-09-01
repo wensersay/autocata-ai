@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query, Upload
 from pydantic import BaseModel, AnyHttpUrl
 from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
-import requests, io, re, os, math, time, unicodedata
+import requests, io, re, os, math, time
 import numpy as np
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -71,16 +71,12 @@ BAD_TOKENS = {
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
-    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo: se filtran si son colas con dirección
+    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo: estos se filtran si son colas con dirección
 }
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
-def strip_accents(s: str) -> str:
-    # Convierte ÁÉÍÓÚÜÑÇ… → AEIOUUNC (sin diacríticos)
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-
-# Reordenador: carga de nombres comunes (añade variantes con y sin acentos)
+# Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
     try:
@@ -90,7 +86,6 @@ def load_name_hints() -> set:
                     t = line.strip().upper()
                     if t:
                         base.add(t)
-                        base.add(strip_accents(t))  # añade variante sin acentos
     except Exception:
         pass
     if NAME_HINTS_EXTRA:
@@ -98,10 +93,18 @@ def load_name_hints() -> set:
             t = t.strip()
             if t:
                 base.add(t)
-                base.add(strip_accents(t))      # añade variante sin acentos
     if not base:
-        base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
-                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
+        # Base ampliada con DOSINDA y ROGELIO para tu caso
+        base |= {
+            "JOSE","JOSÉ","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
+            "ALEJANDRO","PABLO","JESUS","JESÚS","FRANCISCO","FERNANDO","ALBERTO",
+            "RODRIGO","DIEGO","DAVID","ÁLVARO","ALVARO","IGNACIO","JON","IKER",
+            "MARC","ORIOL","XAVIER","POL","XOSE","XOSE","XOÁN","XOAN","IKER",
+            "GORKA","AITOR","UNAI","ANDONI","MIKEL","ASIER",
+            "ROGELIO","DOSINDA",  # <- añadidos clave
+            "MARIA","MARÍA","ANA","LAURA","MARTA","SARA","CARMEN","PILAR","LUCÍA","LUCIA",
+            "SOFIA","SOFÍA","ELENA","LORENA","PAULA","ANDREA","NURIA","RAQUEL"
+        }
     return base
 
 NAME_HINTS = load_name_hints()
@@ -128,8 +131,7 @@ def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
     given = 0
     while i >= 0:
         t = tokens[i]
-        # comprobamos con y sin acentos gracias a NAME_HINTS ya normalizado
-        if t in NAME_HINTS or t in NAME_CONNECTORS or strip_accents(t) in NAME_HINTS:
+        if t in NAME_HINTS or t in NAME_CONNECTORS:
             given += 1
             i -= 1
         else:
@@ -429,11 +431,12 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
     """
     Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean"}
+      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
     Reglas:
       1) si t1_raw contiene un nombre válido → strict
       2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
       3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
+      4) si L1 es apellidos y t1_extra_raw es nombre → l1_plus_extra (nombre + apellidos)
     """
     # 1) L1 puro
     owner1 = clean_owner_line(t1_raw.upper())
@@ -444,8 +447,14 @@ def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tupl
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
-            # unir si L1 tenía algo
             if owner1 and owner1 not in JUNK_2NDLINE:
+                # ¿La segunda parte parece nombre (pista)?
+                if t1e in NAME_HINTS:
+                    cand = f"{t1e} {owner1}".strip()  # nombre + apellidos
+                    cand = strip_after_delims(cand)[:48]
+                    if cand:
+                        return cand, "l1_plus_extra", True
+                # si no, concatenamos como continuación
                 cand = f"{owner1} {t1e}".strip()
             else:
                 cand = t1e
@@ -670,5 +679,4 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
