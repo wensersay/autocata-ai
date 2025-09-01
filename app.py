@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.2")
+app = FastAPI(title="AutoCatastro AI", version="0.6.3")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -105,6 +105,13 @@ def load_name_hints() -> set:
     return base
 
 NAME_HINTS = load_name_hints()
+# NUEVO: set normalizado (sin acentos) para hacer matching robusto
+HINTS_NORM = set(strip_accents(x) for x in NAME_HINTS)
+
+def is_given_token(tok: str) -> bool:
+    """True si el token es un nombre propio conocido (con o sin acentos)."""
+    u = tok.upper()
+    return (u in NAME_HINTS) or (strip_accents(u) in HINTS_NORM)
 
 ORG_TOKENS = {"S.L","S.A","SL","SA","SLU","SCOOP","S.COOP","SC","CB","SCP","AYUNTAMIENTO",
               "CONCELLO","DIOCESIS","DIOCESÍS","PARROQUIA","IGLESIA","SOCIEDAD","FUNDACION",
@@ -126,7 +133,7 @@ def _trim_trailing_noise(tokens: List[str]) -> List[str]:
     out = tokens[:]
     while out:
         t = out[-1]
-        if (len(t) == 1 and t not in NAME_CONNECTORS and t not in NAME_HINTS) or (t in JUNK_TAIL_TOKENS):
+        if (len(t) == 1 and t not in NAME_CONNECTORS and not is_given_token(t)) or (t in JUNK_TAIL_TOKENS):
             out.pop()
         else:
             break
@@ -137,7 +144,7 @@ def _run_given_from_end(tokens: List[str]) -> List[str]:
     i = len(tokens) - 1
     while i >= 0:
         t = tokens[i].upper()
-        if (t in NAME_HINTS) or (strip_accents(t) in NAME_HINTS) or (t in NAME_CONNECTORS):
+        if is_given_token(t) or (t in NAME_CONNECTORS):
             res.append(tokens[i])
             i -= 1
         else:
@@ -150,7 +157,7 @@ def _run_given_from_start(tokens: List[str]) -> List[str]:
     i = 0
     while i < len(tokens):
         t = tokens[i].upper()
-        if (t in NAME_HINTS) or (strip_accents(t) in NAME_HINTS) or (t in NAME_CONNECTORS):
+        if is_given_token(t) or (t in NAME_CONNECTORS):
             res.append(tokens[i])
         else:
             break
@@ -630,5 +637,6 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
