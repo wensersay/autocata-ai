@@ -23,18 +23,23 @@ TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
 
 # DPI / Raster
 FAST_DPI = int(os.getenv("FAST_DPI", "300").strip() or "300")
-PDF_DPI  = int(os.getenv("PDF_DPI",  "340").strip() or "340")
-AUTO_DPI = (os.getenv("AUTO_DPI", "0").strip() == "1")
+PDF_DPI  = int(os.getenv("PDF_DPI",  "300").strip() or "300")
+AUTO_DPI = (os.getenv("AUTO_DPI", "1").strip() == "1")
 DPI_LADDER = [int(x) for x in re.split(r"[,\s]+", os.getenv("DPI_LADDER", "300,340").strip()) if x]
 
 # 2ª línea: tokens ruidosos a ignorar
-JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR").split(",")) if t.strip()])
+JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR,JA").split(",")) if t.strip()])
 
 # Reordenador Nombre(s) + Apellidos
 REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1").strip() == "1"
 REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
+
+# Emparejado por fila (parche anti-puntitos)
+ROW_BAND_FRAC = float(os.getenv("ROW_BAND_FRAC", "0.16"))       # ancho relativo de la banda vertical por fila
+NEIGH_MIN_AREA_HARD = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))  # área mínima dura para rojos
+SIDE_MAX_DIST_FRAC = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35")) # distancia máxima razonable (relativa al ancho)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autorización
@@ -95,7 +100,7 @@ def load_name_hints() -> set:
                 base.add(t)
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
-                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA","ROGELIO","DOSINDA"}
+                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
     return base
 
 NAME_HINTS = load_name_hints()
@@ -241,6 +246,7 @@ def side_of_8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
     ang = math.degrees(math.atan2(-(sy), sx))  # 0=Este, 90= Norte
+    # sector de 45° centrado en las direcciones cardinales
     if -22.5 <= ang < 22.5: return "este"
     if 22.5 <= ang < 67.5: return "noreste"
     if 67.5 <= ang < 112.5: return "norte"
@@ -324,6 +330,13 @@ def pick_owner_from_text(txt: str) -> str:
 # (metodología "anclada a cabecera" + fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,dict]:
+    """
+    Busca 'APELLIDOS' y 'NIF' en una ventana vertical alrededor de row_y.
+    Devuelve (x0, x1, y0_l1, y1_l1, dbg)
+      - (x0,x1): rango de columna del nombre (hasta x de 'NIF' si existe)
+      - (y0_l1,y1_l1): primera línea de nombre
+    Si no encuentra cabecera: fallback proporcional.
+    """
     h, w = bgr.shape[:2]
     win = int(h * 0.14)
     y0s, y1s = max(0, row_y - win), min(h, row_y + win)
@@ -370,8 +383,14 @@ def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,d
     return x0, x1, y0_l1, y1_l1, dbg
 
 def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tuple[str,str,dict]:
+    """
+    Lee L1 y L2 (L2 justo debajo de L1). Si Tesseract mete \n dentro de L1,
+    separa t1_raw y t1_extra_raw.
+    """
     h, w = bgr.shape[:2]
+    # ROI L1
     roi1 = bgr[y0_l1:y1_l1, x0:x1]
+    # ROI L2: ventana del mismo alto inmediatamente debajo
     y0_l2 = y1_l1 + 2
     y1_l2 = min(h, y0_l2 + (y1_l1 - y0_l1))
     roi2 = bgr[y0_l2:y1_l2, x0:x1]
@@ -392,6 +411,7 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 
     t1_raw = ocr_roi(roi1)
     t2_raw = ocr_roi(roi2)
+    # Caso: L1 con salto de línea dentro
     t1_extra_raw = ""
     if "\n" in t1_raw:
         parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
@@ -405,29 +425,34 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
     return t1_raw, t2_raw, dbg
 
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
+    """
+    Devuelve (owner, picked_from, second_line_used)
+      picked_from in {"strict","l1_plus_extra","l2_clean"}
+    Reglas:
+      1) si t1_raw contiene un nombre válido → strict
+      2) si t1_extra_raw parece nombre → l1_plus_extra (se antepone a L1)
+      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
+    """
+    # 1) L1 puro
     owner1 = clean_owner_line(t1_raw.upper())
     if len(owner1) >= 6:
         return owner1, "strict", False
 
+    # 2) L1 tenía salto -> usar segunda parte si parece nombre (antepuesta)
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
-            if owner1 and owner1 not in JUNK_2NDLINE:
-                cand = f"{owner1} {t1e}".strip()
-            else:
-                cand = t1e
+            cand = (f"{t1e} {owner1}".strip() if owner1 and owner1 not in JUNK_2NDLINE else t1e)
             cand = strip_after_delims(cand)[:48]
             if cand:
                 return cand, "l1_plus_extra", True
 
+    # 3) L2 si no es ruido
     if t2_raw:
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
-            if owner1 and owner1 not in JUNK_2NDLINE:
-                cand = f"{owner1} {t2}".strip()
-            else:
-                cand = t2
+            cand = (f"{owner1} {t2}".strip() if owner1 and owner1 not in JUNK_2NDLINE else t2)
             cand = strip_after_delims(cand)[:48]
             if cand:
                 return cand, "l2_clean", True
@@ -449,20 +474,8 @@ def detect_rows_and_extract(bgr: np.ndarray,
     crop = bgr[top:bottom, left:right]
 
     mg, mp = color_masks(crop)
-
-    # ── UMBRALES DINÁMICOS ─────────────────────────────────────────
-    ch, cw = crop.shape[:2]
-    crop_area = max(1, ch * cw)
-    min_main  = max(120, int(0.00010 * crop_area))
-    min_neigh = max( 90, int(0.00007 * crop_area))
-
-    mains  = contours_centroids(mg, min_area=min_main)
-    neighs = contours_centroids(mp, min_area=min_neigh)
-
-    # Segunda pasada "relax" si vemos muy pocas filas
-    if len(mains) < 4:
-        mains  = contours_centroids(mg, min_area=max(80,  int(0.00006 * crop_area)))
-        neighs = contours_centroids(mp, min_area=max(60,  int(0.00005 * crop_area)))
+    mains  = contours_centroids(mg, min_area=(320 if FAST_MODE else 220))
+    neighs = contours_centroids(mp, min_area=(220 if FAST_MODE else 160))
 
     linderos8 = {"norte":"","noreste":"","este":"","sureste":"","sur":"","suroeste":"","oeste":"","noroeste":""}
     rows_dbg = []
@@ -471,20 +484,36 @@ def detect_rows_and_extract(bgr: np.ndarray,
         return linderos8, {"rows": [], "note":"no mains"}, vis
 
     mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
-    mains_abs.sort(key=lambda t: t[1])
+    mains_abs.sort(key=lambda t: t[1])   # de arriba a abajo
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
     used_sides = set()
 
     for (mcx, mcy, _a) in mains_abs[:8]:
-        # vecino más cercano
-        best = None; best_d = 1e9
-        for (nx, ny, _na) in neighs_abs:
-            d = (nx-mcx)**2 + (ny-mcy)**2
-            if d < best_d:
-                best_d = d; best = (nx, ny)
+        # ── (PARCHE) Emparejado por banda + área mínima dura ────────────────
+        band_half = int(h * ROW_BAND_FRAC * 0.5)
+        y0_band, y1_band = max(0, mcy - band_half), min(h, mcy + band_half)
+
+        cand_neighs = [(nx, ny, na) for (nx, ny, na) in neighs_abs
+                       if y0_band <= ny <= y1_band and na >= NEIGH_MIN_AREA_HARD]
+
+        if cand_neighs:
+            nx, ny, na = max(cand_neighs, key=lambda t: t[2])  # el de mayor área en la banda
+            best = (nx, ny)
+            dist2 = (nx - mcx)**2 + (ny - mcy)**2
+        else:
+            # Fallback: de todo el set, el más cercano con área mínima dura
+            best = None; best_d = 1e9
+            for (nx, ny, na) in neighs_abs:
+                if na < NEIGH_MIN_AREA_HARD:
+                    continue
+                d = (nx - mcx)**2 + (ny - mcy)**2
+                if d < best_d:
+                    best_d = d; best = (nx, ny)
+            dist2 = best_d if best is not None else 1e9
+
         side = ""
-        if best is not None and best_d < (w*0.28)**2:
+        if best is not None and dist2 < (w * SIDE_MAX_DIST_FRAC) ** 2:
             side = side_of_8((mcx, mcy), best)
 
         # OCR anclado a cabecera + fallback
@@ -496,6 +525,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
         if owner:
             owner = reorder_name_if_confident(owner)
 
+        # Evitar sobrescribir el mismo lado si ya está relleno con un nombre más largo
         if side and owner:
             if side not in used_sides or len(owner) > len(linderos8.get(side,"")):
                 linderos8[side] = owner
@@ -546,7 +576,10 @@ def health():
         "REORDER_TO_NOMBRE_APELLIDOS": REORDER_TO_NOMBRE_APELLIDOS,
         "REORDER_MIN_CONF": REORDER_MIN_CONF,
         "name_hints_loaded": len(NAME_HINTS),
-        "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
+        "cv2_flags": {"OTSU": bool(THRESH_OTSU)},
+        "ROW_BAND_FRAC": ROW_BAND_FRAC,
+        "NEIGH_MIN_AREA_HARD": NEIGH_MIN_AREA_HARD,
+        "SIDE_MAX_DIST_FRAC": SIDE_MAX_DIST_FRAC
     }
 
 @app.get("/preview", dependencies=[Depends(check_token)])
@@ -561,6 +594,7 @@ def preview_get(
         _linderos, _dbg, vis = detect_rows_and_extract(
             bgr, annotate=bool(labels), annotate_names=bool(names)
         )
+        # Pintar pequeña leyenda DPI
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
@@ -646,6 +680,5 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
 
