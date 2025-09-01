@@ -8,6 +8,7 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
 import pytesseract
+import unicodedata  # ← nuevo (para quitar tildes)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
@@ -31,7 +32,7 @@ DPI_LADDER = [int(x) for x in re.split(r"[,\s]+", os.getenv("DPI_LADDER", "300,3
 JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR").split(",")) if t.strip()])
 
 # Reordenador Nombre(s) + Apellidos
-REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1").strip() == "1"
+REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "0").strip() == "1"
 REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
@@ -76,6 +77,13 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
+# Quitar acentos (para igualar "JOSÉ" con "JOSE")
+def strip_accents(s: str) -> str:
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
+
 # Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
@@ -99,6 +107,9 @@ def load_name_hints() -> set:
     return base
 
 NAME_HINTS = load_name_hints()
+# Añade variantes sin tilde para que JOSE=JOSÉ, ANGEL=ÁNGEL, etc.
+NAME_HINTS = {h for h in NAME_HINTS if h}
+NAME_HINTS |= {strip_accents(h) for h in NAME_HINTS}
 
 ORG_TOKENS = {"S.L","S.A","SL","SA","SLU","SCOOP","S.COOP","SC","CB","SCP","AYUNTAMIENTO",
               "CONCELLO","DIOCESIS","DIOCESÍS","PARROQUIA","IGLESIA","SOCIEDAD","FUNDACION",
@@ -422,43 +433,46 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
     """
     Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","l1_plus_extra","from_l1_break","l2_clean"}
+      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
     Reglas:
-      1) Construye candidato con L1 y, si existe, añade t1_extra_raw (si parece nombre).
-      2) Si no hay nada útil aún, usa L2 si no es ruido.
+      1) si t1_raw contiene un nombre válido → strict
+      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
+      2b) si L1 y extra son válidos, unir como "extra + L1" → l1_plus_extra
+      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
     """
-    # 1) Limpia L1
+    # 1) L1 puro
     owner1 = clean_owner_line(t1_raw.upper())
-    picked_from = "strict"
-    used_second = False
+    if len(owner1) >= 6:
+        return owner1, "strict", False
 
-    # Añadir t1_extra_raw (cuando Tesseract mete el 2º nombre en la misma L1)
+    # 2) L1 tenía salto -> usar segunda parte si parece nombre
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
-        if t1e and t1e not in JUNK_2NDLINE and len(t1e) <= 26:
+        if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
+            # unir con L1 si L1 tenía algo válido
             if owner1 and owner1 not in JUNK_2NDLINE:
-                owner1 = f"{owner1} {t1e}".strip()
+                cand = f"{t1e} {owner1}".strip()   # extra delante
+                return cand[:48], "l1_plus_extra", True
             else:
-                owner1 = t1e
-            picked_from = "l1_plus_extra"
-            used_second = True
+                cand = t1e
+                cand = strip_after_delims(cand)[:48]
+                if cand:
+                    return cand, "from_l1_break", True
 
-    # Si ya tenemos un nombre mínimamente largo, devolvemos
-    if len(owner1) >= 6:
-        return owner1, picked_from, used_second
-
-    # 2) L2 si no es ruido
+    # 3) L2 si no es ruido
     if t2_raw:
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
-            owner2 = f"{owner1} {t2}".strip() if owner1 else t2
-            owner2 = strip_after_delims(owner2)[:48]
-            if owner2:
-                return owner2, "l2_clean", True
+            if owner1 and owner1 not in JUNK_2NDLINE:
+                cand = f"{owner1} {t2}".strip()
+            else:
+                cand = t2
+            cand = strip_after_delims(cand)[:48]
+            if cand:
+                return cand, "l2_clean", True
 
-    # Nada mejor
-    return owner1, "strict", used_second
+    return owner1, "strict", False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline por filas (detección de puntos + OCR columna)
@@ -662,5 +676,6 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
 
 
