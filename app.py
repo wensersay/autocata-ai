@@ -76,15 +76,6 @@ GEO_TOKENS = {
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
-# Núcleo de nombres que SIEMPRE consideraremos “de pila”
-CORE_HINTS = {
-    "JOSE","LUIS","MARIA","JUAN","ANTONIO","MANUEL","MIGUEL","FRANCISCO",
-    "JAVIER","CARLOS","ALEJANDRO","PABLO","FERNANDO","RAFAEL","PEDRO",
-    "DIEGO","ALBERTO","ÁNGEL","ANGEL","MARTA","LAURA","ANA","SOFIA","PAULA",
-    # regionales que ya usas
-    "ROGELIO","DOSINDA"
-}
-
 # Reordenador: carga de nombres comunes
 def load_name_hints() -> set:
     base = set()
@@ -105,8 +96,6 @@ def load_name_hints() -> set:
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
                  "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
-    # Garantiza el núcleo mínimo siempre presente
-    base |= CORE_HINTS
     return base
 
 NAME_HINTS = load_name_hints()
@@ -125,6 +114,18 @@ def looks_like_org(name: str) -> bool:
 
 def split_tokens(s: str) -> list:
     return [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", s.upper()) if t]
+
+# NUEVO: quita colas de 1–2 letras que no sean conectores ni nombres de la lista
+def prune_trailing_short(tokens: list) -> list:
+    """Quita del final tokens de 1–2 letras que no sean conectores ni hints de nombre."""
+    i = len(tokens)
+    while i > 0:
+        t = tokens[i-1]
+        if len(t) <= 2 and t not in NAME_CONNECTORS and t not in NAME_HINTS:
+            i -= 1
+            continue
+        break
+    return tokens[:i]
 
 def confidence_trailing_given(tokens: list) -> Tuple[float,int]:
     if not tokens:
@@ -150,8 +151,14 @@ def reorder_name_if_confident(name: str) -> str:
     if not name or looks_like_org(name):
         return name
     toks = split_tokens(name)
+
+    # NUEVO: ignora colas de 1–2 letras (p.ej. "M", "CL") que estorban la detección
+    toks = prune_trailing_short(toks)
+    if len(toks) < 2:
+        return name
+
     conf, g = confidence_trailing_given(toks)
-    if conf < REORDER_MIN_CONF or g == 0 or len(toks) < 2:
+    if conf < REORDER_MIN_CONF or g == 0:
         return name
     head = toks[:-g]
     tail = toks[-g:]
@@ -313,6 +320,12 @@ def clean_owner_line(line: str) -> str:
             continue
         compact.append(t)
     name = " ".join(compact).strip()
+
+    # NUEVO: quita colas tipo "M", "CL", etc. si no son conectores ni nombres
+    toks2 = prune_trailing_short(compact)
+    if toks2 != compact:
+        name = " ".join(toks2).strip()
+
     return name[:48]
 
 def pick_owner_from_text(txt: str) -> str:
@@ -674,5 +687,4 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
 
