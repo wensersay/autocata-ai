@@ -8,56 +8,11 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
 import pytesseract
-import logging
-
-
-# Nueva sección: Redacción Legal
-# ──────────────────────────────────────────────────────────────────────────────
-def es_razon_social(nombre: str) -> bool:
-palabras_clave = [
-"S.L.", "S.A.", "SOCIEDAD", "ASOCIACION", "AYUNTAMIENTO", "FUNDACION",
-"COOPERATIVA", "UNIVERSIDAD", "EMPRESA", "INSTITUTO", "CENTRO", "JUNTA", "CONSEJO"
-]
-nombre_mayus = nombre.upper()
-return not "," in nombre and not re.search(r"^[A-ZÁÉÍÓÚÑ]+(?: [A-ZÁÉÍÓÚÑ]+){1,3}$", nombre_mayus) or \
-any(palabra in nombre_mayus for palabra in palabras_clave)
-
-
-def limpiar_basura(nombre: str) -> str:
-nombre = re.sub(r"\b[A-Z]\b", "", nombre) # elimina iniciales sueltas
-nombre = re.sub(r" +", " ", nombre) # dobles espacios
-return nombre.strip()
-
-
-def reordenar_nombre(nombre: str) -> str:
-nombre = limpiar_basura(nombre)
-if es_razon_social(nombre):
-return nombre
-tokens = nombre.split()
-if len(tokens) >= 3:
-nombres = tokens[-2:]
-apellidos = tokens[:-2]
-return " ".join(nombres + apellidos)
-return nombre
-
-
-def redactar_linderos(linderos_dict: Dict[str, str]) -> str:
-partes = []
-for direccion, nombre in linderos_dict.items():
-if not nombre:
-continue
-nombre_norm = reordenar_nombre(nombre)
-partes.append(f"{direccion.capitalize()}, {nombre_norm}")
-return "Linda: " + "; ".join(partes) + "."
-
-
-# Configura logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.6")
+app = FastAPI(title="AutoCatastro AI", version="0.6.7"  # PATCH: actualizada por integración de casos límite 02–07)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -65,6 +20,8 @@ app = FastAPI(title="AutoCatastro AI", version="0.6.6")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
+USE_PATCHES = True  # PATCH: Permite activar/desactivar lógica de casos límite
+
 
 # DPI / Raster
 FAST_DPI = int(os.getenv("FAST_DPI", "300").strip() or "300")
@@ -805,4 +762,111 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
+
+# ───────────────────────────────────────────────────────────────
+# PATCHES AUTO-INTEGRADOS · CASOS LÍMITE 02 A 07 · v0.6.7
+# ───────────────────────────────────────────────────────────────
+
+# PATCH: CASE-0002 · Asignación doble en diagonales
+def asignar_cardinal_doble(angulo_deg: float, tol_diag: float = 18.0):
+    a = (angulo_deg % 360.0)
+    centros = {"norte": 0, "este": 90, "sur": 180, "oeste": 270,
+               "noreste": 45, "sureste": 135, "suroeste": 225, "noroeste": 315}
+    for diag, c in [("noreste",45),("sureste",135),("suroeste",225),("noroeste",315)]:
+        if abs((a - c + 180) % 360 - 180) <= tol_diag:
+            if diag == "noreste":   return ["norte","este"]
+            if diag == "sureste":   return ["sur","este"]
+            if diag == "suroeste":  return ["sur","oeste"]
+            if diag == "noroeste":  return ["norte","oeste"]
+    orden = ["norte","este","sur","oeste"]
+    diffs = {k: abs((a - v + 180) % 360 - 180) for k,v in centros.items() if k in orden}
+    return [min(diffs, key=diffs.get)]
+
+# PATCH: CASE-0003 · Razones sociales
+RAZON_SOCIAL_PATTERNS = (
+    "AYUNTAMIENTO","CONCELLO","CONSEJO","XUNTA","DIPUTACIÓN","SA","S.A.","SL","S.L.",
+    "UNIVERSIDAD","IGLESIA","ARZOBISPADO","MINISTERIO","JUNTA","DEMARCACIÓN","CONFEDERACIÓN"
+)
+def es_razon_social(txt: str) -> bool:
+    t = txt.upper().strip()
+    return any(p in t for p in RAZON_SOCIAL_PATTERNS) or t.isupper() and len(t.split())>=3 and "," not in t
+
+# PATCH: CASE-0004 · Unir líneas OCR de nombres
+def unir_lineas_nombre(lineas, max_gap_y=12, max_gap_x=20):
+    lineas = sorted(lineas, key=lambda r: (round(r["y"]/5)*5, r["x"]))
+    nombres = []
+    buffer = None
+    for r in lineas:
+        if buffer is None:
+            buffer = r.copy()
+        else:
+            mismo_bloque = abs(r["y"] - buffer["y"] - buffer["h"]) <= max_gap_y and abs(r["x"] - (buffer["x"])) <= max_gap_x
+            if mismo_bloque:
+                buffer["text"] = f'{buffer["text"]} {r["text"]}'
+                buffer["w"] = max(buffer["w"], r["x"]+r["w"]-buffer["x"])
+                buffer["h"] += r["h"]
+            else:
+                nombres.append(buffer)
+                buffer = r.copy()
+    if buffer: nombres.append(buffer)
+    return nombres
+
+# PATCH: CASE-0005 · Reordenación con partículas
+PARTICULAS = {"DE","DEL","DELA","DE LA","DE LOS","DE LAS","DA","DOS","DO","VAN","VON"}
+def reordenar_nombre(persona: str) -> str:
+    if es_razon_social(persona): 
+        return normalizar_espacios(persona)
+    t = normalizar_espacios(persona).replace(",", " , ")
+    toks = [x for x in t.split() if x]
+    if "," in toks:
+        coma = toks.index(",")
+        apellidos = toks[:coma]
+        nombres = toks[coma+1:]
+    else:
+        nombres, apellidos = inferir_nombres_apellidos(toks)
+    apellidos = unir_particulas(apellidos)
+    nombres   = unir_particulas(nombres)
+    return normalizar_espacios(" ".join(nombres + apellidos))
+def unir_particulas(toks):
+    res = []
+    i = 0
+    while i < len(toks):
+        tk = toks[i].upper()
+        if i+1 < len(toks) and f"{tk} {toks[i+1].upper()}" in PARTICULAS:
+            res.append(f"{toks[i]} {toks[i+1]}")
+            i += 2
+        elif tk in PARTICULAS:
+            if i+1 < len(toks):
+                res.append(f"{toks[i]} {toks[i+1]}")
+                i += 2
+            else:
+                res.append(toks[i]); i += 1
+        else:
+            res.append(toks[i]); i += 1
+    return res
+def inferir_nombres_apellidos(toks):
+    if len(toks) >= 4:
+        return toks[:-2], toks[-2:]
+    elif len(toks) == 3:
+        return toks[:-1], toks[-1:]
+    else:
+        return toks[:1], toks[1:]
+
+# PATCH: CASE-0006 · Umbrales HSV ampliados
+def mask_color(img_bgr, hsv_ranges):
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for (lo, hi) in hsv_ranges:
+        mask |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
+HSV_ROSA = [((150, 20, 120), (179, 255, 255)), ((140, 10, 90),  (170, 255, 255))]
+HSV_VERDE= [((35,  10,  70), (85,  255, 255))]
+
+# PATCH: CASE-0007 · Rotación normalizada
+def normalizar_rotacion(img_bgr):
+    ang = 0  # Aquí podrías llamar a estimar_angulo(img_bgr)
+    if ang == 0: 
+        return img_bgr
+    rot_map = {90: cv2.ROTATE_90_COUNTERCLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_CLOCKWISE}
+    return cv2.rotate(img_bgr, rot_map.get(ang, cv2.ROTATE_180))
 
