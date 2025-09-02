@@ -8,6 +8,51 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import cv2
 import pytesseract
+import logging
+
+
+# Nueva sección: Redacción Legal
+# ──────────────────────────────────────────────────────────────────────────────
+def es_razon_social(nombre: str) -> bool:
+palabras_clave = [
+"S.L.", "S.A.", "SOCIEDAD", "ASOCIACION", "AYUNTAMIENTO", "FUNDACION",
+"COOPERATIVA", "UNIVERSIDAD", "EMPRESA", "INSTITUTO", "CENTRO", "JUNTA", "CONSEJO"
+]
+nombre_mayus = nombre.upper()
+return not "," in nombre and not re.search(r"^[A-ZÁÉÍÓÚÑ]+(?: [A-ZÁÉÍÓÚÑ]+){1,3}$", nombre_mayus) or \
+any(palabra in nombre_mayus for palabra in palabras_clave)
+
+
+def limpiar_basura(nombre: str) -> str:
+nombre = re.sub(r"\b[A-Z]\b", "", nombre) # elimina iniciales sueltas
+nombre = re.sub(r" +", " ", nombre) # dobles espacios
+return nombre.strip()
+
+
+def reordenar_nombre(nombre: str) -> str:
+nombre = limpiar_basura(nombre)
+if es_razon_social(nombre):
+return nombre
+tokens = nombre.split()
+if len(tokens) >= 3:
+nombres = tokens[-2:]
+apellidos = tokens[:-2]
+return " ".join(nombres + apellidos)
+return nombre
+
+
+def redactar_linderos(linderos_dict: Dict[str, str]) -> str:
+partes = []
+for direccion, nombre in linderos_dict.items():
+if not nombre:
+continue
+nombre_norm = reordenar_nombre(nombre)
+partes.append(f"{direccion.capitalize()}, {nombre_norm}")
+return "Linda: " + "; ".join(partes) + "."
+
+
+# Configura logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
