@@ -806,5 +806,3 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             debug={"exception": str(e)} if debug else None
         )
 
-
-
