@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Body, Depends, Header, Query, Upload
 from pydantic import BaseModel, AnyHttpUrl
 from starlette.responses import StreamingResponse
 from typing import Dict, List, Optional, Tuple
-import requests, io, re, os, math, time, asyncio
+import requests, io, re, os, math, time
 import numpy as np
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.7"  # PATCH: actualizada por integración de casos límite 02–07)
+app = FastAPI(title="AutoCatastro AI", version="0.6.7")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
@@ -20,23 +20,29 @@ app = FastAPI(title="AutoCatastro AI", version="0.6.7"  # PATCH: actualizada por
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 FAST_MODE  = (os.getenv("FAST_MODE",  "1").strip() == "1")
 TEXT_ONLY  = (os.getenv("TEXT_ONLY",  "0").strip() == "1")
-USE_PATCHES = True  # PATCH: Permite activar/desactivar lógica de casos límite
-
 
 # DPI / Raster
 FAST_DPI = int(os.getenv("FAST_DPI", "300").strip() or "300")
 PDF_DPI  = int(os.getenv("PDF_DPI",  "340").strip() or "340")
-AUTO_DPI = (os.getenv("AUTO_DPI", "0").strip() == "1")
+AUTO_DPI = (os.getenv("AUTO_DPI", "1").strip() == "1")
 DPI_LADDER = [int(x) for x in re.split(r"[,\s]+", os.getenv("DPI_LADDER", "300,340").strip()) if x]
 
 # 2ª línea: tokens ruidosos a ignorar
-JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR").split(",")) if t.strip()])
+JUNK_2NDLINE = set([t.strip().upper() for t in (os.getenv("JUNK_2NDLINE", "Z,VA,EO,SS,KO,KR,JA,A").split(",")) if t.strip()])
 
 # Reordenador Nombre(s) + Apellidos
 REORDER_TO_NOMBRE_APELLIDOS = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1").strip() == "1"
 REORDER_MIN_CONF = float(os.getenv("REORDER_MIN_CONF", "0.70"))
 NAME_HINTS_EXTRA = os.getenv("NAME_HINTS_EXTRA", "").strip()
 NAMES_FILE = os.getenv("NAME_HINTS_FILE", "data/nombres_es.txt")
+
+# Detección de croquis / vecinos
+MAIN_MIN_AREA_HARD   = int(os.getenv("MAIN_MIN_AREA_HARD", "260"))
+NEIGH_MIN_AREA_HARD  = int(os.getenv("NEIGH_MIN_AREA_HARD", "180"))
+SIDE_MAX_DIST_FRAC   = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.35"))  # distancia máx. main->neigh en fracción del ancho
+ROW_BAND_FRAC        = float(os.getenv("ROW_BAND_FRAC", "0.16"))       # alto de ventana para buscar cabecera (proporción H)
+SIDE_REFINE_MODE     = os.getenv("SIDE_REFINE_MODE", "histo").strip()  # nearest | histo | both
+HIST_REFINE_R_FRAC   = float(os.getenv("HIST_REFINE_R_FRAC", "0.06"))  # radio (fracción del min(H,W)) alrededor del vecino
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autorización
@@ -52,18 +58,6 @@ class ExtractIn(BaseModel):
     pdf_url: AnyHttpUrl
 
 class ExtractOut(BaseModel):
-    linderos: Dict[str, str]
-    owners_detected: List[str] = []
-    note: Optional[str] = None
-    debug: Optional[dict] = None
-
-# Batch
-class ExtractManyIn(BaseModel):
-    pdf_urls: List[AnyHttpUrl]
-
-class ExtractManyItem(BaseModel):
-    pdf_url: AnyHttpUrl
-    ok: bool
     linderos: Dict[str, str]
     owners_detected: List[str] = []
     note: Optional[str] = None
@@ -85,7 +79,7 @@ BAD_TOKENS = {
 GEO_TOKENS = {
     "LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA",
     "MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO",
-    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"  # ojo con direcciones
+    "GALICIA","[LUGO]","[BARCELONA]","O","DE","DEL","DA","DO"
 }
 
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
@@ -109,7 +103,7 @@ def load_name_hints() -> set:
                 base.add(t)
     if not base:
         base |= {"JOSE","LUIS","JUAN","ANTONIO","MANUEL","MIGUEL","JAVIER","CARLOS",
-                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA"}
+                 "ALEJANDRO","PABLO","MARIA","ANA","LAURA","MARTA","SARA","ROGELIO","SERGIO"}
     return base
 
 NAME_HINTS = load_name_hints()
@@ -184,11 +178,6 @@ THRESH_OTSU       = cv_flag("THRESH_OTSU", 0)
 # Raster (pág. 2) con AutoDPI opcional
 # ──────────────────────────────────────────────────────────────────────────────
 def raster_page2(pdf_bytes: bytes) -> Tuple[np.ndarray, dict]:
-    """
-    Devuelve (bgr, debug_raster)
-    - Usa AUTO_DPI si está activo: prueba la escalera y se queda con el primer render OK.
-    - Si no: usa FAST_DPI si FAST_MODE, si no PDF_DPI.
-    """
     dbg = {"dpi": None, "ladder_used": None}
     use_ladder = AUTO_DPI and DPI_LADDER
     dpis = DPI_LADDER if use_ladder else [FAST_DPI if FAST_MODE else PDF_DPI]
@@ -248,14 +237,13 @@ def contours_centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,in
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lado por ángulo (8 direcciones)
+# Lado por ángulo (8 direcciones) + refinado por histograma con selector por ejes
 # ──────────────────────────────────────────────────────────────────────────────
 def side_of_8(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
     cx, cy = main_xy
     x, y   = pt_xy
     sx, sy = x - cx, y - cy
     ang = math.degrees(math.atan2(-(sy), sx))  # 0=Este, 90= Norte
-    # sector de 45° centrado en las direcciones cardinales
     if -22.5 <= ang < 22.5: return "este"
     if 22.5 <= ang < 67.5: return "noreste"
     if 67.5 <= ang < 112.5: return "norte"
@@ -269,6 +257,26 @@ SIDE2LBL = {
     "norte":"N", "noreste":"NE", "este":"E", "sureste":"SE",
     "sur":"S", "suroeste":"SO", "oeste":"O", "noroeste":"NO"
 }
+
+def pick_side_from_hist(wsum: dict) -> str:
+    """Selector por ejes: primero decide eje vertical/horizontal y luego la dirección."""
+    north_axis = wsum.get("norte",0) + 0.5*(wsum.get("noreste",0)+wsum.get("noroeste",0))
+    south_axis = wsum.get("sur",0)   + 0.5*(wsum.get("sureste",0)+wsum.get("suroeste",0))
+    east_axis  = wsum.get("este",0)  + 0.5*(wsum.get("noreste",0)+wsum.get("sureste",0))
+    west_axis  = wsum.get("oeste",0) + 0.5*(wsum.get("noroeste",0)+wsum.get("suroeste",0))
+
+    vert = max(north_axis, south_axis)
+    hori = max(east_axis,  west_axis)
+
+    if vert >= hori:
+        cand = {k:wsum.get(k,0) for k in ("norte","noreste","noroeste")}
+        return max(cand.items(), key=lambda kv: kv[1])[0]
+    else:
+        if west_axis > east_axis:
+            cand = {k:wsum.get(k,0) for k in ("oeste","noroeste","suroeste")}
+        else:
+            cand = {k:wsum.get(k,0) for k in ("este","noreste","sureste")}
+        return max(cand.items(), key=lambda kv: kv[1])[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OCR utils
@@ -336,18 +344,10 @@ def pick_owner_from_text(txt: str) -> str:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Localizar columna “Apellidos…” y extraer 1ª + posible 2ª línea
-# (metodología "anclada a cabecera" + fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,dict]:
-    """
-    Busca 'APELLIDOS' y 'NIF' en una ventana vertical alrededor de row_y.
-    Devuelve (x0, x1, y0_l1, y1_l1, dbg)
-      - (x0,x1): rango de columna del nombre (hasta x de 'NIF' si existe)
-      - (y0_l1,y1_l1): primera línea de nombre
-    Si no encuentra cabecera: fallback proporcional.
-    """
     h, w = bgr.shape[:2]
-    win = int(h * 0.14)
+    win = int(h * ROW_BAND_FRAC)
     y0s, y1s = max(0, row_y - win), min(h, row_y + win)
     band = bgr[y0s:y1s, int(w*0.28):int(w*0.80)]
     dbg = {"header_found": False, "x_nif_abs": None, "header_left_abs": None}
@@ -392,14 +392,8 @@ def find_header_and_cols(bgr: np.ndarray, row_y: int) -> Tuple[int,int,int,int,d
     return x0, x1, y0_l1, y1_l1, dbg
 
 def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tuple[str,str,dict]:
-    """
-    Lee L1 y L2 (L2 justo debajo de L1). Si Tesseract mete \n dentro de L1,
-    separa t1_raw y t1_extra_raw.
-    """
     h, w = bgr.shape[:2]
-    # ROI L1
     roi1 = bgr[y0_l1:y1_l1, x0:x1]
-    # ROI L2: ventana del mismo alto inmediatamente debajo
     y0_l2 = y1_l1 + 2
     y1_l2 = min(h, y0_l2 + (y1_l1 - y0_l1))
     roi2 = bgr[y0_l2:y1_l2, x0:x1]
@@ -420,7 +414,7 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
 
     t1_raw = ocr_roi(roi1)
     t2_raw = ocr_roi(roi2)
-    # Caso: L1 con salto de línea dentro
+
     t1_extra_raw = ""
     if "\n" in t1_raw:
         parts = [p.strip() for p in t1_raw.split("\n") if p.strip()]
@@ -434,38 +428,29 @@ def read_two_lines(bgr: np.ndarray, x0:int, x1:int, y0_l1:int, y1_l1:int) -> Tup
     return t1_raw, t2_raw, dbg
 
 def choose_owner_from_lines(t1_raw: str, t2_raw: str, t1_extra_raw: str) -> Tuple[str,str,bool]:
-    """
-    Devuelve (owner, picked_from, second_line_used)
-      picked_from in {"strict","from_l1_break","l2_clean","l1_plus_extra"}
-    Reglas:
-      1) si t1_raw contiene un nombre válido → strict
-      2) si t1_extra_raw parece nombre (2ª línea incrustada en L1) → from_l1_break
-      3) si L2 útil (no ruido, no JUNK_2NDLINE, no geo) → l2_clean
-      4) si L1 es apellido y t1_extra_raw es nombre → l1_plus_extra (para compuestos tipo JOSE LUIS)
-    """
     owner1 = clean_owner_line(t1_raw.upper())
     if len(owner1) >= 6:
-        # Si owner1 termina con nombre conocido (caso RODRIGUEZ JOSE) y t1_extra_raw amplía:
-        if t1_extra_raw:
-            t1e = clean_owner_line(t1_extra_raw.upper())
-            if t1e and (t1e in NAME_HINTS or len(t1e) <= 12):
-                cand = f"{owner1} {t1e}".strip()
-                return cand[:48], "l1_plus_extra", True
         return owner1, "strict", False
 
     if t1_extra_raw:
         t1e = clean_owner_line(t1_extra_raw.upper())
         if len(t1e) >= 2 and t1e not in JUNK_2NDLINE:
-            cand = f"{owner1} {t1e}".strip() if owner1 and owner1 not in JUNK_2NDLINE else t1e
+            if owner1 and owner1 not in JUNK_2NDLINE:
+                cand = f"{owner1} {t1e}".strip()
+            else:
+                cand = t1e
             cand = strip_after_delims(cand)[:48]
             if cand:
-                return cand, "from_l1_break", True
+                return cand, "l1_plus_extra", True
 
     if t2_raw:
         t2 = strip_after_delims(t2_raw.upper())
         t2 = re.sub(r"\s+", " ", t2).strip()
         if t2 and t2 not in JUNK_2NDLINE and t2 not in GEO_TOKENS and len(t2) <= 26:
-            cand = f"{owner1} {t2}".strip() if owner1 and owner1 not in JUNK_2NDLINE else t2
+            if owner1 and owner1 not in JUNK_2NDLINE:
+                cand = f"{owner1} {t2}".strip()
+            else:
+                cand = t2
             cand = strip_after_delims(cand)[:48]
             if cand:
                 return cand, "l2_clean", True
@@ -486,10 +471,12 @@ def detect_rows_and_extract(bgr: np.ndarray,
     left = int(w * 0.04); right = int(w * 0.42)
     crop = bgr[top:bottom, left:right]
 
-    mg, mp = color_masks(crop)
-    # umbrales sensibles: colindantes finos
-    mains  = contours_centroids(mg, min_area=(300 if FAST_MODE else 220))
-    neighs = contours_centroids(mp, min_area=(140 if FAST_MODE else 120))
+    # Máscaras en el recorte (detección de blobs) y en toda la página (refinado)
+    mg_c, mp_c = color_masks(crop)
+    mg_f, mp_f = color_masks(bgr)
+
+    mains  = contours_centroids(mg_c, min_area=(MAIN_MIN_AREA_HARD if not FAST_MODE else MAIN_MIN_AREA_HARD))
+    neighs = contours_centroids(mp_c, min_area=(NEIGH_MIN_AREA_HARD if not FAST_MODE else NEIGH_MIN_AREA_HARD))
 
     linderos8 = {"norte":"","noreste":"","este":"","sureste":"","sur":"","suroeste":"","oeste":"","noroeste":""}
     rows_dbg = []
@@ -502,39 +489,47 @@ def detect_rows_and_extract(bgr: np.ndarray,
     neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
 
     used_sides = set()
-
-    # función auxiliar para refinar el punto vecino cuando es muy fino/lineal
-    def refine_point(main_xy, neigh_xy):
-        mx, my = main_xy
-        nx, ny = neigh_xy
-        dx, dy = nx - mx, ny - my
-        # desplaza un poco hacia el exterior y estabiliza con histograma de vecindad
-        rx, ry = int(nx + 0.06*dx), int(ny + 0.06*dy)
-        rx = max(0, min(w-1, rx)); ry = max(0, min(h-1, ry))
-        # histograma angular simple
-        hist = {"este":0,"noreste":0,"norte":0,"noroeste":0,"oeste":0,"suroeste":0,"sur":0,"sureste":0}
-        for k in range(-6,7,2):
-            px, py = rx + k, ry + k
-            px = max(0, min(w-1, px)); py = max(0, min(h-1, py))
-            s = side_of_8((mx,my), (px,py))
-            hist[s] += abs(k)+1
-        best = max(hist.items(), key=lambda kv: kv[1])[0]
-        return (rx,ry), best, hist
+    dmax2 = (w * SIDE_MAX_DIST_FRAC) ** 2
 
     for (mcx, mcy, _a) in mains_abs[:8]:
         # vecino más cercano
-        best = None; best_d = 1e9
+        best = None; best_d = 1e12
         for (nx, ny, _na) in neighs_abs:
             d = (nx-mcx)**2 + (ny-mcy)**2
             if d < best_d:
                 best_d = d; best = (nx, ny)
+
         side = ""
-        refined_info = {}
-        if best is not None and best_d < (w*0.28)**2:
-            # refina dirección si es fino/diagonal
-            rp, side_ref, hist = refine_point((mcx,mcy), best)
-            side = side_ref
-            refined_info = {"refined_point": list(rp), "refined_mode":"histo", "refined_hist": hist}
+        refined_point = None
+        refined_hist = None
+        refined_mode = None
+
+        if best is not None and best_d < dmax2:
+            side = side_of_8((mcx, mcy), best)
+
+            if SIDE_REFINE_MODE in ("histo","both"):
+                # Ventana en torno al vecino (en máscara roja full)
+                R = int(min(h, w) * HIST_REFINE_R_FRAC)
+                nx, ny = best
+                x0 = max(0, nx - R); x1 = min(w, nx + R)
+                y0 = max(0, ny - R); y1 = min(h, ny + R)
+                sub = mp_f[y0:y1, x0:x1]
+                wsum = {"norte":0,"noreste":0,"este":0,"sureste":0,"sur":0,"suroeste":0,"oeste":0,"noroeste":0}
+                ys, xs = np.where(sub > 0)
+                # Acumula peso 1/dist para dar más importancia a píxeles cercanos al main
+                for yy, xx in zip(ys, xs):
+                    ax = x0 + int(xx)
+                    ay = y0 + int(yy)
+                    # evitar el área principal verde (no debería haber rojo ahí)
+                    dx, dy = ax - mcx, ay - mcy
+                    dist = math.hypot(dx, dy) + 1e-6
+                    s = side_of_8((mcx, mcy), (ax, ay))
+                    wsum[s] += 1.0 / dist
+                refined_hist = wsum
+                refined_point = (nx, ny)
+                refined_mode = "histo"
+                # Selector por ejes:
+                side = pick_side_from_hist(wsum)
 
         # OCR anclado a cabecera + fallback
         x0, x1, y0_l1, y1_l1, header_dbg = find_header_and_cols(bgr, mcy)
@@ -565,7 +560,7 @@ def detect_rows_and_extract(bgr: np.ndarray,
             cv2.putText(vis, owner[:28], (int(w*0.44), mcy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
 
-        row_dbg_one = {
+        row_dbg = {
             "row_y": mcy,
             "main_center": [mcx, mcy],
             "neigh_center": list(best) if best is not None else None,
@@ -575,8 +570,11 @@ def detect_rows_and_extract(bgr: np.ndarray,
             "used_second": used_second,
             "ocr": ocr_dbg | header_dbg
         }
-        row_dbg_one.update(refined_info)
-        rows_dbg.append(row_dbg_one)
+        if refined_point is not None:
+            row_dbg["refined_point"] = list(refined_point)
+            row_dbg["refined_mode"] = refined_mode
+            row_dbg["refined_hist"] = refined_hist
+        rows_dbg.append(row_dbg)
 
     dbg = {"rows": rows_dbg}
     return linderos8, dbg, vis
@@ -598,6 +596,11 @@ def health():
         "REORDER_TO_NOMBRE_APELLIDOS": REORDER_TO_NOMBRE_APELLIDOS,
         "REORDER_MIN_CONF": REORDER_MIN_CONF,
         "name_hints_loaded": len(NAME_HINTS),
+        "SIDE_REFINE_MODE": SIDE_REFINE_MODE,
+        "ROW_BAND_FRAC": ROW_BAND_FRAC,
+        "SIDE_MAX_DIST_FRAC": SIDE_MAX_DIST_FRAC,
+        "NEIGH_MIN_AREA_HARD": NEIGH_MIN_AREA_HARD,
+        "HIST_REFINE_R_FRAC": HIST_REFINE_R_FRAC,
         "cv2_flags": {"OTSU": bool(THRESH_OTSU)}
     }
 
@@ -613,7 +616,6 @@ def preview_get(
         _linderos, _dbg, vis = detect_rows_and_extract(
             bgr, annotate=bool(labels), annotate_names=bool(names)
         )
-        # Pintar pequeña leyenda DPI
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(vis, f"DPI:{raster_dbg.get('dpi')}", (12,28),
@@ -675,69 +677,6 @@ def extract(data: ExtractIn = Body(...), debug: bool = Query(False)) -> ExtractO
         )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Batch: hasta 10 PDFs en paralelo controlado
-# ──────────────────────────────────────────────────────────────────────────────
-@app.post("/extract_many", response_model=List[ExtractManyItem], dependencies=[Depends(check_token)])
-async def extract_many(
-    data: ExtractManyIn = Body(...),
-    debug: bool = Query(False),
-    max_concurrency: int = Query(4, ge=1, le=8, description="Límite de tareas simultáneas"),
-    timeout_s: int = Query(25, ge=5, le=120, description="Timeout por PDF")
-) -> List[ExtractManyItem]:
-    # normaliza lista, de-dup y limita a 10
-    urls = list(dict.fromkeys([str(u) for u in data.pdf_urls]))[:10]
-    sem = asyncio.Semaphore(max_concurrency)
-
-    async def run_one(url: str) -> dict:
-        async with sem:
-            async def job():
-                pdf_bytes = await asyncio.to_thread(fetch_pdf_bytes, url)
-                bgr, raster_dbg = await asyncio.to_thread(raster_page2, pdf_bytes)
-                linderos8, vdbg, _ = await asyncio.to_thread(detect_rows_and_extract, bgr, False)
-                owners_detected = [o.get("owner","") for o in vdbg["rows"] if o.get("owner")]
-                owners_detected = list(dict.fromkeys(owners_detected))[:12]
-                note = None
-                if not any(linderos8.values()):
-                    note = "No se pudo determinar lado/vecino con suficiente confianza."
-                dbg = None
-                if debug:
-                    dbg = vdbg
-                    dbg["raster"] = raster_dbg
-                return {
-                    "pdf_url": url,
-                    "ok": True,
-                    "linderos": linderos8,
-                    "owners_detected": owners_detected,
-                    "note": note,
-                    "debug": dbg
-                }
-
-            try:
-                return await asyncio.wait_for(job(), timeout=timeout_s)
-            except asyncio.TimeoutError:
-                return {
-                    "pdf_url": url,
-                    "ok": False,
-                    "linderos": {"norte":"","noreste":"","este":"","sureste":"","sur":"","suroeste":"","oeste":"","noroeste":""},
-                    "owners_detected": [],
-                    "note": f"Timeout tras {timeout_s}s",
-                    "debug": {"timeout": True} if debug else None
-                }
-            except Exception as e:
-                return {
-                    "pdf_url": url,
-                    "ok": False,
-                    "linderos": {"norte":"","noreste":"","este":"","sureste":"","sur":"","suroeste":"","oeste":"","noroeste":""},
-                    "owners_detected": [],
-                    "note": f"Excepción: {e}",
-                    "debug": {"exception": str(e)} if debug else None
-                }
-
-    results = await asyncio.gather(*(run_one(u) for u in urls))
-    # FastAPI validará contra ExtractManyItem
-    return results  # type: ignore[return-value]
-
-# ──────────────────────────────────────────────────────────────────────────────
 # (Opcional) Carga directa de PDF como archivo (útil para test locales)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.post("/extract_upload", response_model=ExtractOut, dependencies=[Depends(check_token)])
@@ -762,111 +701,4 @@ async def extract_upload(file: UploadFile = File(...), debug: bool = Query(False
             note=f"Excepción visión/OCR: {e}",
             debug={"exception": str(e)} if debug else None
         )
-
-# ───────────────────────────────────────────────────────────────
-# PATCHES AUTO-INTEGRADOS · CASOS LÍMITE 02 A 07 · v0.6.7
-# ───────────────────────────────────────────────────────────────
-
-# PATCH: CASE-0002 · Asignación doble en diagonales
-def asignar_cardinal_doble(angulo_deg: float, tol_diag: float = 18.0):
-    a = (angulo_deg % 360.0)
-    centros = {"norte": 0, "este": 90, "sur": 180, "oeste": 270,
-               "noreste": 45, "sureste": 135, "suroeste": 225, "noroeste": 315}
-    for diag, c in [("noreste",45),("sureste",135),("suroeste",225),("noroeste",315)]:
-        if abs((a - c + 180) % 360 - 180) <= tol_diag:
-            if diag == "noreste":   return ["norte","este"]
-            if diag == "sureste":   return ["sur","este"]
-            if diag == "suroeste":  return ["sur","oeste"]
-            if diag == "noroeste":  return ["norte","oeste"]
-    orden = ["norte","este","sur","oeste"]
-    diffs = {k: abs((a - v + 180) % 360 - 180) for k,v in centros.items() if k in orden}
-    return [min(diffs, key=diffs.get)]
-
-# PATCH: CASE-0003 · Razones sociales
-RAZON_SOCIAL_PATTERNS = (
-    "AYUNTAMIENTO","CONCELLO","CONSEJO","XUNTA","DIPUTACIÓN","SA","S.A.","SL","S.L.",
-    "UNIVERSIDAD","IGLESIA","ARZOBISPADO","MINISTERIO","JUNTA","DEMARCACIÓN","CONFEDERACIÓN"
-)
-def es_razon_social(txt: str) -> bool:
-    t = txt.upper().strip()
-    return any(p in t for p in RAZON_SOCIAL_PATTERNS) or t.isupper() and len(t.split())>=3 and "," not in t
-
-# PATCH: CASE-0004 · Unir líneas OCR de nombres
-def unir_lineas_nombre(lineas, max_gap_y=12, max_gap_x=20):
-    lineas = sorted(lineas, key=lambda r: (round(r["y"]/5)*5, r["x"]))
-    nombres = []
-    buffer = None
-    for r in lineas:
-        if buffer is None:
-            buffer = r.copy()
-        else:
-            mismo_bloque = abs(r["y"] - buffer["y"] - buffer["h"]) <= max_gap_y and abs(r["x"] - (buffer["x"])) <= max_gap_x
-            if mismo_bloque:
-                buffer["text"] = f'{buffer["text"]} {r["text"]}'
-                buffer["w"] = max(buffer["w"], r["x"]+r["w"]-buffer["x"])
-                buffer["h"] += r["h"]
-            else:
-                nombres.append(buffer)
-                buffer = r.copy()
-    if buffer: nombres.append(buffer)
-    return nombres
-
-# PATCH: CASE-0005 · Reordenación con partículas
-PARTICULAS = {"DE","DEL","DELA","DE LA","DE LOS","DE LAS","DA","DOS","DO","VAN","VON"}
-def reordenar_nombre(persona: str) -> str:
-    if es_razon_social(persona): 
-        return normalizar_espacios(persona)
-    t = normalizar_espacios(persona).replace(",", " , ")
-    toks = [x for x in t.split() if x]
-    if "," in toks:
-        coma = toks.index(",")
-        apellidos = toks[:coma]
-        nombres = toks[coma+1:]
-    else:
-        nombres, apellidos = inferir_nombres_apellidos(toks)
-    apellidos = unir_particulas(apellidos)
-    nombres   = unir_particulas(nombres)
-    return normalizar_espacios(" ".join(nombres + apellidos))
-def unir_particulas(toks):
-    res = []
-    i = 0
-    while i < len(toks):
-        tk = toks[i].upper()
-        if i+1 < len(toks) and f"{tk} {toks[i+1].upper()}" in PARTICULAS:
-            res.append(f"{toks[i]} {toks[i+1]}")
-            i += 2
-        elif tk in PARTICULAS:
-            if i+1 < len(toks):
-                res.append(f"{toks[i]} {toks[i+1]}")
-                i += 2
-            else:
-                res.append(toks[i]); i += 1
-        else:
-            res.append(toks[i]); i += 1
-    return res
-def inferir_nombres_apellidos(toks):
-    if len(toks) >= 4:
-        return toks[:-2], toks[-2:]
-    elif len(toks) == 3:
-        return toks[:-1], toks[-1:]
-    else:
-        return toks[:1], toks[1:]
-
-# PATCH: CASE-0006 · Umbrales HSV ampliados
-def mask_color(img_bgr, hsv_ranges):
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for (lo, hi) in hsv_ranges:
-        mask |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
-    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
-HSV_ROSA = [((150, 20, 120), (179, 255, 255)), ((140, 10, 90),  (170, 255, 255))]
-HSV_VERDE= [((35,  10,  70), (85,  255, 255))]
-
-# PATCH: CASE-0007 · Rotación normalizada
-def normalizar_rotacion(img_bgr):
-    ang = 0  # Aquí podrías llamar a estimar_angulo(img_bgr)
-    if ang == 0: 
-        return img_bgr
-    rot_map = {90: cv2.ROTATE_90_COUNTERCLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_CLOCKWISE}
-    return cv2.rotate(img_bgr, rot_map.get(ang, cv2.ROTATE_180))
 
